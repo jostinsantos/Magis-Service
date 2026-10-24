@@ -54,3 +54,11 @@ Si un host no responde, el repositorio devuelve un resultado vacío/error en lug
 - Acepta el tipo como segundo argumento de `getMeta` cuando el runtime lo pasa como texto.
 
 La validación local comprueba sintaxis y empaquetado. La respuesta real depende del proveedor y debe verificarse con una sesión activa.
+
+
+## Correcciones 1.3.0
+- El filtro de categorías cambia dinámicamente al tipo seleccionado y usa `getNextColumns` como en `MagisService.loadCategories`.
+- Descubrir consulta `v3/getShelveData` para el catálogo raíz y las categorías, con IDs de columna reales.
+- La ficha reconoce `assetData`, `simpleProgramList` y `sameSeasonSeriesList`, igual que `MagisCatalog.parseDetail`.
+- Para IDs sin tipo conocido, la ficha prueba los tipos Magis de película y serie en vez de asumir siempre película.
+- Las temporadas vinculadas se consultan con límite para recuperar los capítulos de cada temporada.

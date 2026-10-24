@@ -203,22 +203,24 @@ function normalizeItem(raw, forcedType) {
     if (!backdrop && kind === 'poster') backdrop = url;
     if (!poster) poster = url;
   }
-  const programType = String(raw.programType || raw.contentType || raw.type || 'movie').toLowerCase();
-  let type = forcedType || (['teleplay','series','variety','0'].includes(programType) ? 'series' : 'movie');
+  const programType = String(raw.programType || raw.contentType || raw.type || raw.mediaType || 'movie').toLowerCase();
+  const explicitMovie = ['movie','film','1','cinema','feature'].includes(programType);
+  let type = forcedType || (!explicitMovie && ['teleplay','series','variety','0'].includes(programType) ? 'series' : 'movie');
   if (type === 'movies') type = 'movie'; if (type === 'animation') type = 'anime';
-  const name = String(raw.name || raw.contentName || raw.programName || raw.assetName || raw.viewPoint || raw.alias || raw.title || raw.contentId || raw.id || 'Sin título');
-  const release = String(raw.releaseTime || raw.year || raw.releaseDate || '');
-  const genres = raw.genres || raw.genreList || raw.categoryList || raw.categoryNameList || raw.categoryName || raw.genre || [];
+  const name = String(raw.name || raw.viewPoint || raw.alias || raw.title || raw.contentName || raw.programName || raw.assetName || raw.contentId || raw.id || raw.assetId || raw.programId || 'Sin título');
+  const release = String(raw.releaseTime || raw.year || raw.releaseDate || raw.publishTime || raw.firstAirDate || '');
+  const genres = raw.genres || raw.genreList || raw.categoryList || raw.categoryNameList || raw.categoryName || raw.genre || raw.tags || []; 
   const item = Object.assign({}, raw, {
-    id:String(raw.contentId || raw.id || raw.assetId || ''), contentId:String(raw.contentId || raw.id || raw.assetId || ''),
+    id:String(raw.contentId || raw.id || raw.assetId || raw.programId || raw.videoId || ''), contentId:String(raw.contentId || raw.id || raw.assetId || raw.programId || raw.videoId || ''),
     title:name, name, type, media_type:type, year:/^\d{4}/.test(release) ? release.slice(0,4) : release,
     poster, image:poster, backdrop, background:backdrop,
-    description:String(raw.description || raw.desc || raw.introduction || raw.intro || raw.summary || raw.plot || raw.contentDesc || raw.programDesc || ''),
-    overview:String(raw.description || raw.desc || raw.introduction || raw.intro || raw.summary || raw.plot || raw.contentDesc || raw.programDesc || ''),
+    description:String(raw.description || raw.desc || raw.introduction || raw.intro || raw.summary || raw.plot || raw.contentDesc || raw.programDesc || raw.assetDesc || raw.brief || ''),
+    overview:String(raw.description || raw.desc || raw.introduction || raw.intro || raw.summary || raw.plot || raw.contentDesc || raw.programDesc || raw.assetDesc || raw.brief || ''),
     genres:Array.isArray(genres) ? genres.map(g => typeof g === 'object' ? String(g.name || g.title || '') : String(g)).filter(Boolean) : String(genres || '').split(/[,|;]/).map(x=>x.trim()).filter(Boolean),
     programType: type === 'series' ? 'series' : type === 'anime' ? (programType || 'anime') : 'movie'
   });
   if (raw.score != null && item.rating == null) item.rating = Number(raw.score) || null;
+  if (item.id) itemKinds.set(item.id, item.type);
   return item;
 }
 function rowName(row, fallback) { return String(row.name || row.columnName || row.title || row.recommendName || fallback); }
@@ -337,56 +339,105 @@ async function getCatalog(catalogId, options) {
   const kind=id.includes('anime') || id.includes('anim') ? 'anime' : id.includes('series') ? 'series' : 'movies';
   return getDiscover(Object.assign({}, opts, {kind}));
 }
-async function getDiscoverFilters() {
-  const kinds=['movies','series','anime'];
-  const results=await Promise.all(kinds.map(kind=>homeRows(kind).catch(()=>[])));
-  const options=[{id:'all',label:'Todas las categorías'}];
-  const seen=new Set(['all']);
-  for(let i=0;i<kinds.length;i++) {
-    for(const row of results[i]) {
-      const id=String(row.id || row.code || '');
-      if(!id || seen.has(id)) continue;
-      seen.add(id); categoryKinds.set(id,kinds[i]);
+async function categoryRows(kind) {
+  const code = HOME[kind] || HOME.movies;
+  const forcedType = kind === 'series' ? 'series' : kind === 'anime' ? 'anime' : 'movie';
+  // Match MagisService.loadCategories(): getNextColumns is the primary source of
+  // selectable category IDs; Home rows are only a fallback.
+  try {
+    const data = await api('getNextColumns', {columnCode:code,pageNum:1,pageSize:50,version:''});
+    const rows = normalizeRows(data, kindLabel(kind), forcedType);
+    const usable = rows.filter(r => r.id || r.code);
+    if (usable.length) { categoryKindsFromRows(usable, kind); return usable; }
+  } catch (_) {}
+  const rows = await homeRows(kind).catch(()=>[]);
+  categoryKindsFromRows(rows, kind);
+  return rows.filter(r => r.id || r.code);
+}
+async function getDiscoverFilters(filters) {
+  const opts = filters && typeof filters === 'object' ? filters : {};
+  const rawType = String(opts.type || opts.kind || 'movie').toLowerCase();
+  const kind = rawType.includes('anime') || rawType.includes('anim') ? 'anime' : rawType.includes('series') ? 'series' : rawType.includes('all') ? 'all' : 'movies';
+  const types = [{id:'movie',label:'Películas'},{id:'series',label:'Series'},{id:'anime',label:'Animación'}];
+  const kinds = kind === 'all' ? ['movies','series','anime'] : [kind];
+  const rowsByKind = await Promise.all(kinds.map(k => categoryRows(k).catch(()=>[])));
+  const options = [{id:'all',label:'Todas las categorías'}];
+  const seen = new Set(['all']);
+  for (let i=0;i<kinds.length;i++) {
+    for (const row of rowsByKind[i]) {
+      // Use the numeric columnId for getShelveData, while retaining the code map.
+      const id = String(row.id || row.code || '');
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      categoryKinds.set(id, kinds[i]);
       if (row.code) categoryKinds.set(String(row.code), kinds[i]);
-      options.push({id,label:row.title || row.name || kindLabel(kinds[i])});
+      options.push({id,label:row.title || row.name || kindLabel(kinds[i]), columnId:String(row.id || ''), columnCode:String(row.code || ''), type:kinds[i] === 'movies' ? 'movie' : kinds[i]});
     }
   }
   return [
-    {id:'type',name:'Tipo',label:'Tipo',type:'select',options:[{id:'movie',label:'Películas'},{id:'series',label:'Series'},{id:'anime',label:'Animación'}]},
+    {id:'type',name:'Tipo',label:'Tipo',type:'select',options:types},
     {id:'category',name:'Categoría',label:'Categoría',type:'select',options}
   ];
 }
 async function getDiscover(options) {
-  const opts=options && typeof options==='object' ? options : {};
-  const requested=String(opts.type || opts.kind || 'movie').toLowerCase();
-  let kind=requested.includes('anime') || requested.includes('anim') ? 'anime' : requested.includes('series') ? 'series' : requested.includes('all') ? 'all' : 'movies';
-  let columnId=String(opts.columnId || opts.categoryId || '');
-  const category=String(opts.category || '');
-  if (!columnId && category && category !== 'all') columnId=category;
-  if (columnId) {
-    const mapped=categoryKinds.get(columnId);
-    // Some service rows expose a columnCode separately from the numeric columnId.
-    // Prefer the known numeric ID when we can resolve it from cached Home rows.
-    const wanted=columnId;
-    for (const kindKey of ['movies','series','anime']) {
-      const cachedRows=responseCache.get('homeRows:'+kindKey)?.value || [];
-      const found=cachedRows.find(r=>String(r.code)===wanted || String(r.id)===wanted);
-      if(found && found.id) { columnId=String(found.id); break; }
+  const opts = options && typeof options === 'object' ? options : {};
+  const requested = String(opts.type || opts.kind || 'movie').toLowerCase();
+  const kind = requested.includes('anime') || requested.includes('anim') ? 'anime' : requested.includes('series') ? 'series' : requested.includes('all') ? 'all' : 'movies';
+  const page = Math.max(1, parseInt(opts.page,10) || 1);
+  const pageSize = 40;
+  let selected = String(opts.columnId || opts.categoryId || opts.category || opts.genre || opts.filter || '');
+  if (selected === 'all' || selected === 'Todas las categorías') selected = '';
+  if (selected && !opts.columnId && !opts.categoryId) {
+    // Resolve selected column code to the actual numeric columnId.
+    const mapped = categoryKinds.get(selected);
+    const searchKinds = mapped ? [mapped] : (kind === 'all' ? ['movies','series','anime'] : [kind]);
+    for (const k of searchKinds) {
+      const rows = await categoryRows(k).catch(()=>[]);
+      const found = rows.find(r => String(r.id) === selected || String(r.code) === selected || r.title === selected || r.name === selected);
+      if (found) { selected = String(found.id || found.code); categoryKinds.set(selected,k); break; }
     }
-    try {
-      const data=await api('v3/getShelveData',{columnId,columnType:'2',pageNum:Math.max(1,parseInt(opts.page,10)||1),pageSize:40,encryptVersion:0});
-      const inferred=mapped || (kind==='anime'?'anime':kind==='series'?'series':kind==='movies'?'movie':undefined);
-      const items=flattenItems(data, inferred==='anime'?'anime':undefined).map(it=>{ const t=inferred || itemType(it); const iid=String(it.contentId||it.id||''); if(iid) itemKinds.set(iid,t); return Object.assign(it,{type:t,media_type:t}); });
-      const total=Number(data.assetListTotalSize || data.totalSize || data.total || items.length);
-      return {items,page:Math.max(1,parseInt(opts.page,10)||1),hasMore:(Math.max(1,parseInt(opts.page,10)||1)*40)<total,total};
-    } catch (_) { return {items:[],page:Math.max(1,parseInt(opts.page,10)||1),hasMore:false,total:0}; }
   }
-  let kinds=kind==='all'?['movies','series','anime']:[kind];
-  const results=await Promise.all(kinds.map(k=>homeRows(k).catch(()=>[])));
-  const rows=results.flat();
-  const all=unique(rows.flatMap(r=>r.items)).map(it=>Object.assign({},it,{type:kind==='all'?itemType(it):kind==='anime'?'anime':itemType(it)}));
-  const page=Math.max(1,parseInt(opts.page,10)||1), start=(page-1)*40;
-  return {items:all.slice(start,start+40),page,hasMore:start+40<all.length,total:all.length,categories:rows.map(r=>({id:r.id,name:r.name,code:r.code}))};
+  if (selected) {
+    const mapped = categoryKinds.get(selected);
+    const inferred = mapped || (kind === 'all' ? '' : kind);
+    try {
+      const data = await api('v3/getShelveData',{columnId:selected,columnType:'2',pageNum:page,pageSize,encryptVersion:0});
+      let items = flattenItems(data, inferred === 'anime' ? 'anime' : inferred === 'series' ? 'series' : inferred === 'movies' ? 'movie' : undefined);
+      if (!items.length) items = normalizeRows(data,'Catálogo', inferred === 'anime' ? 'anime' : inferred === 'series' ? 'series' : inferred === 'movies' ? 'movie' : undefined).flatMap(r=>r.items);
+      items = unique(items).map(it=>{
+        const t = inferred === 'anime' ? 'anime' : inferred === 'series' ? 'series' : inferred === 'movies' ? 'movie' : itemType(it);
+        if (it.id) itemKinds.set(it.id,t);
+        return Object.assign({},it,{type:t,media_type:t});
+      });
+      const total = Number(data.assetListTotalSize || data.totalSize || data.total || items.length);
+      return {items,page,hasMore:total > 0 ? page*pageSize < total : items.length === pageSize,total};
+    } catch (_) { return {items:[],page,hasMore:false,total:0}; }
+  }
+  if (kind === 'all') {
+    const results = await Promise.all(['movies','series','anime'].map(k=>categoryRows(k).catch(()=>[])));
+    const rows = results.flat();
+    const items = unique(rows.flatMap(r=>r.items)).map(it=>Object.assign({},it,{type:itemType(it),media_type:itemType(it)}));
+    const start=(page-1)*pageSize;
+    return {items:items.slice(start,start+pageSize),page,hasMore:start+pageSize<items.length,total:items.length,categories:rows.map(r=>({id:r.id,name:r.name,code:r.code}))};
+  }
+  const rootId = ROOT[kind] || ROOT.movies;
+  try {
+    const data = await api('v3/getShelveData',{columnId:rootId,columnType:'2',pageNum:page,pageSize,encryptVersion:0});
+    let items = flattenItems(data, kind === 'series' ? 'series' : kind === 'anime' ? 'anime' : 'movie');
+    if (!items.length) items = normalizeRows(data,kindLabel(kind),kind === 'series' ? 'series' : kind === 'anime' ? 'anime' : 'movie').flatMap(r=>r.items);
+    items = unique(items).map(it=>{
+      const t = kind === 'series' ? 'series' : kind === 'anime' ? 'anime' : 'movie';
+      if (it.id) itemKinds.set(it.id,t);
+      return Object.assign({},it,{type:t,media_type:t});
+    });
+    const total = Number(data.assetListTotalSize || data.totalSize || data.total || items.length);
+    if (items.length || total) return {items,page,hasMore:total > 0 ? page*pageSize < total : items.length === pageSize,total};
+  } catch (_) {}
+  // Last-resort fallback to already fetched Home rows; never make extra chains of calls.
+  const rows = await homeRows(kind).catch(()=>[]);
+  const all = unique(rows.flatMap(r=>r.items));
+  const start=(page-1)*pageSize;
+  return {items:all.slice(start,start+pageSize),page,hasMore:start+pageSize<all.length,total:all.length,categories:rows.map(r=>({id:r.id,name:r.name,code:r.code}))};
 }
 async function search(query, options) {
   const q=String(query || '').trim(); if(!q) return [];
@@ -405,55 +456,118 @@ async function search(query, options) {
     return unique([...results[0],...results[1]]).map(it=>{ const kind=itemType(it); const id=String(it.contentId||it.id||''); if(id) itemKinds.set(id,kind); return Object.assign(it,{type:kind,media_type:kind}); });
   });
 }
+function unwrapDetail(response) {
+  let data = response;
+  for (let i=0;i<5 && data && typeof data === 'object';i++) {
+    if (data.assetData && typeof data.assetData === 'object') { data=data.assetData; continue; }
+    if (data.item && typeof data.item === 'object') { data=data.item; continue; }
+    if (data.result && typeof data.result === 'object') { data=data.result; continue; }
+    if (data.data && typeof data.data === 'object' && !data.contentId && !data.name && !data.title && !data.programType) { data=data.data; continue; }
+    break;
+  }
+  return data && typeof data === 'object' ? data : {};
+}
+function episodeRows(data, seriesId) {
+  const raw = listFrom(data,['simpleProgramList','episodeList','episodes','programList','movieList','assetList']);
+  return raw.map((ep,j)=>{
+    const e=normalizeItem(ep);
+    const number=Number(ep.seriesNumber || ep.episodeNum || ep.episodeNo || ep.episode || ep.number || j+1) || j+1;
+    const id=String(ep.contentId || ep.id || ep.movieId || ep.assetId || '');
+    if (!id) return null;
+    return {number, episode:number, id, contentId:id, title:String(ep.name || ep.viewPoint || ep.alias || ep.title || `Capítulo ${number}`), name:String(ep.name || ep.viewPoint || ep.alias || ep.title || `Capítulo ${number}`), overview:String(ep.description || ep.desc || ep.introduction || ''), description:String(ep.description || ep.desc || ep.introduction || ''), still:String(ep.poster || ep.posterUrl || e.poster || e.backdrop || ''), poster:String(ep.poster || ep.posterUrl || e.poster || ''), season:Number(ep.seasonNumber || ep.seasonNum || ep.season || 1) || 1, seriesContentId:String(ep.seriesContentId || seriesId || '')};
+  }).filter(Boolean);
+}
 async function getMeta(id, options) {
-  const opts=options && typeof options==='object'?options:(typeof options==='string'?{type:options}:{});
-  const contentId=String(id && typeof id==='object'?(id.contentId||id.id||id.assetId):id||'').trim();
-  if(!contentId) return null;
-  const seed=id && typeof id==='object'?normalizeItem(id):null;
-  const knownType=String((seed && seed.type) || (itemKinds.get(contentId) || ''));
-  let type=String(opts.type || (knownType==='series'||knownType==='anime'?'0':knownType==='movie'?'1':'1'));
-  if(type==='movie') type='1'; if(type==='series'||type==='anime') type='0';
-  return cached('meta:'+contentId+':'+type, CACHE_TTL['v4/getItemData'], async()=>{
-    const response=await api('v4/getItemData',{contentId,type,sortType:'0',language:'en',macAddr:FIXED_MAC});
-    let data=response;
-    // Service versions wrap details differently: {item}, {data:{item}}, {result:{...}}.
-    for(let i=0;i<4 && data && typeof data==='object';i++) {
-      if(data.item && typeof data.item==='object') { data=data.item; continue; }
-      if(data.result && typeof data.result==='object') { data=data.result; continue; }
-      if(data.data && typeof data.data==='object' && !data.contentId && !data.assetId && !data.name && !data.title) { data=data.data; continue; }
-      break;
+  const opts = options && typeof options === 'object' ? options : (typeof options === 'string' ? {type:options} : {});
+  const contentId = String(id && typeof id === 'object' ? (id.contentId || id.id || id.assetId || id.programId) : id || '').trim();
+  if (!contentId) return null;
+  const seed = id && typeof id === 'object' ? normalizeItem(id) : null;
+  let knownType = String((seed && seed.type) || itemKinds.get(contentId) || '');
+  const explicit = String(opts.type || '').toLowerCase();
+  let preferred = explicit || (knownType === 'series' || knownType === 'anime' ? '0' : knownType === 'movie' ? '1' : '');
+  if (preferred === 'movie' || preferred === 'movies') preferred='1';
+  if (preferred === 'series' || preferred === 'anime' || preferred === 'tv') preferred='0';
+  const types = preferred ? [preferred, preferred === '0' ? '1' : '0'] : ['1','0'];
+  return cached('meta:'+contentId+':'+(preferred || 'auto'), CACHE_TTL['v4/getItemData'], async()=>{
+    let data = {}, fetchedType = preferred || '1';
+    for (const t of types) {
+      try {
+        const response = await api('v4/getItemData',{contentId,type:t,sortType:'0',language:'en',macAddr:FIXED_MAC});
+        const candidate = unwrapDetail(response);
+        const hasIdentity = !!(candidate.contentId || candidate.id || candidate.name || candidate.title || candidate.viewPoint || candidate.assetName);
+        const hasDetail = !!(candidate.description || candidate.introduction || candidate.desc || candidate.posterList || candidate.simpleProgramList || candidate.sameSeasonSeriesList);
+        if (hasIdentity || hasDetail) { data=candidate; fetchedType=t; if (t==='0' || candidate.simpleProgramList || candidate.sameSeasonSeriesList) break; }
+      } catch (_) { /* Try the alternate Magis content type if this one returned no detail. */ }
     }
-    if(!data || typeof data!=='object') data={};
-    const item=normalizeItem(Object.assign({},data,seed||{},data,{contentId,id:contentId}));
-    item.details=data;
-    const rawSeasons=listFrom(data,['seasonList','seasons','seriesList']);
-    item.seasons=rawSeasons.map((season,i)=>{
-      const eps=listFrom(season,['episodeList','episodes','movieList','assetList']).map((ep,j)=>{
-        const e=normalizeItem(ep, item.type==='anime'?'anime':undefined);
-        return {number:Number(ep.episodeNo||ep.episodeNum||ep.episode||ep.number||j+1),id:String(ep.contentId||ep.id||ep.movieId||`${contentId}_e${j+1}`),title:String(ep.name||ep.title||ep.viewPoint||`Episodio ${j+1}`),overview:String(ep.description||ep.desc||''),still:ep.poster||ep.posterUrl||e.poster||item.backdrop||item.poster};
-      });
-      return {number:Number(season.seasonNo||season.seasonNum||season.seasonNumber||season.number||i+1),name:String(season.name||season.title||`Temporada ${i+1}`),episodes:eps};
-    });
-    const episodes=listFrom(data,['episodeList','episodes','movieList']);
-    item.episodes=episodes;
-    item.type=type==='0'?(knownType==='anime'?'anime':'series'):'movie';
-    item.media_type=item.type;
-    item.id=String(item.contentId || item.id || contentId);
-    item.contentId=String(item.contentId || contentId);
-    item.title=String(item.title || item.name || (seed && seed.title) || contentId);
+    const merged = Object.assign({}, seed || {}, data);
+    merged.contentId = String(data.contentId || data.id || contentId);
+    if (!(data.name || data.title || data.viewPoint || data.alias) && seed) merged.name=seed.title || seed.name;
+    const simple = episodeRows(data,contentId);
+    const ptype = String(data.programType || data.contentType || data.type || '').toLowerCase();
+    const isSeries = ['teleplay','series','variety','0','tv'].includes(ptype) || fetchedType === '0' || simple.length > 1 || Array.isArray(data.sameSeasonSeriesList);
+    const type = isSeries ? (knownType === 'anime' ? 'anime' : 'series') : 'movie';
+    const item = normalizeItem(merged, type);
+    item.type=type; item.media_type=type; item.programType=isSeries?'series':'movie';
+    item.id=String(data.contentId || data.id || contentId); item.contentId=item.id;
+    item.title=String(data.name || data.viewPoint || data.alias || data.title || data.contentName || data.programName || item.title || contentId);
     item.name=item.title;
-    item.overview=String(item.overview || item.description || item.details?.description || item.details?.introduction || '');
-    item.description=item.overview;
-    if(item.id) itemKinds.set(item.id,item.type);
-    item.media_type=item.type;
+    item.description=String(data.description || data.introduction || data.desc || data.contentDesc || data.programDesc || item.description || '');
+    item.overview=item.description;
+    item.details=data;
+    const bySeason = new Map();
+    for (const ep of simple) { const n=Number(ep.season || 1); if(!bySeason.has(n)) bySeason.set(n,[]); bySeason.get(n).push(ep); }
+    const siblings = Array.isArray(data.sameSeasonSeriesList) ? data.sameSeasonSeriesList : [];
+    const currentSeason = Number(data.seasonNumber || data.season || parseSeasonFromName(item.title) || 1) || 1;
+    if (isSeries && !bySeason.has(currentSeason) && simple.length) bySeason.set(currentSeason,simple);
+    const seasons=[];
+    for (const [number, episodes] of Array.from(bySeason.entries()).sort((a,b)=>a[0]-b[0])) {
+      seasons.push({number,season:number,name:`Temporada ${number}`,title:`Temporada ${number}`,episodes:episodes.sort((a,b)=>a.number-b.number)});
+    }
+    // Magis frequently models each season as a separate contentId, linked through sameSeasonSeriesList.
+    // Fetch each linked season's simpleProgramList, bounded to six extra calls, just as the second app does.
+    if (isSeries && siblings.length) {
+      const links=[]; const seen=new Set([item.id]);
+      for (const sibling of siblings) {
+        const sid=String(sibling.contentId || sibling.id || '').trim();
+        if(!sid || seen.has(sid)) continue; seen.add(sid);
+        const sn=Number(sibling.seasonNumber || sibling.season || parseSeasonFromName(sibling.name || sibling.title || '') || 0) || 0;
+        links.push({id:sid,number:sn,name:String(sibling.name || sibling.viewPoint || sibling.title || (sn?`Temporada ${sn}`:'Temporada')),poster:sibling.poster || sibling.posterUrl || ''});
+      }
+      for (const link of links.slice(0,6)) {
+        try {
+          const sr=await api('v4/getItemData',{contentId:link.id,type:'0',sortType:'0',language:'en',macAddr:FIXED_MAC});
+          const sd=unwrapDetail(sr); const eps=episodeRows(sd,link.id);
+          const n=link.number || Number(sd.seasonNumber || sd.season || parseSeasonFromName(link.name) || seasons.length+1);
+          const existing=seasons.find(x=>x.number===n);
+          if(existing) { if(!existing.episodes.length) existing.episodes=eps; }
+          else seasons.push({number:n,season:n,name:link.name || `Temporada ${n}`,title:link.name || `Temporada ${n}`,episodes:eps});
+        } catch (_) { /* keep available seasons even if one linked season cannot load */ }
+      }
+      if (!seasons.length) {
+        for (const link of links) seasons.push({number:link.number || seasons.length+1,season:link.number || seasons.length+1,name:link.name,episodes:[]});
+      }
+    }
+    if (isSeries && !seasons.length) {
+      seasons.push({number:currentSeason,season:currentSeason,name:`Temporada ${currentSeason}`,episodes:simple});
+    }
+    seasons.sort((a,b)=>Number(a.number)-Number(b.number));
+    item.seasons=seasons;
+    item.episodes=simple;
+    item.seasonSiblings=siblings;
+    item.genres = item.genres || [];
+    if(item.id) itemKinds.set(item.id,type);
     return item;
   });
 }
+function parseSeasonFromName(name) {
+  const m=String(name||'').match(/(?:temporada|season|temp\.?|\bT|\bS)\s*(\d+)/i);
+  return m ? Number(m[1]) : 0;
+}
 async function getStreams(id, type, season, episode) {
-  const contentId = String(id && typeof id === 'object' ? (id.contentId || id.id) : id || '').trim();
+  const contentId = String(id && typeof id === 'object' ? (id.contentId || id.id || id.assetId) : id || '').trim();
   if (!contentId) return [];
-  const itemTypeHint = String(type || (id && id.type) || 'movie').toLowerCase();
-  const seriesContentId = itemTypeHint === 'series' || itemTypeHint === 'anime' ? contentId : '';
+  const itemTypeHint = String(type || (id && id.type) || itemKinds.get(contentId) || 'movie').toLowerCase();
+  const seriesContentId = itemTypeHint === 'series' || itemTypeHint === 'anime' ? String((id && id.seriesContentId) || contentId) : ''; 
   const play = await api('v10/startPlayVOD',{contentId,seriesContentId,startTime:0,type:'1',columnId:0,authType:''});
   let media = null;
   const episodes = listFrom(play,['episodeList']);
