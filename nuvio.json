@@ -1,8 +1,8 @@
 {
   "id": "magis-service-catalog",
   "name": "Magis Service Catalog",
-  "version": "1.3.0",
-  "description": "Port de MagisCatalog: categorías por tipo, fichas detalladas y temporadas/capítulos.",
+  "version": "1.4.0",
+  "description": "Port de MagisCatalog: filtros por categoría, paginación y reproducción de episodios.",
   "author": "Community",
   "entry": "index.js",
   "languages": [

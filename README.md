@@ -62,3 +62,13 @@ La validación local comprueba sintaxis y empaquetado. La respuesta real depende
 - La ficha reconoce `assetData`, `simpleProgramList` y `sameSeasonSeriesList`, igual que `MagisCatalog.parseDetail`.
 - Para IDs sin tipo conocido, la ficha prueba los tipos Magis de película y serie en vez de asumir siempre película.
 - Las temporadas vinculadas se consultan con límite para recuperar los capítulos de cada temporada.
+
+
+## Cambios 1.4.0
+
+- Las categorías usan `columnId` real; `columnCode` ya no se envía como si fuera un ID de estantería.
+- Descubrir solicita 20 elementos por página y limita la respuesta aunque el portal devuelva más elementos de los pedidos. La pantalla de la app puede seguir cargando páginas al desplazarse.
+- Se guarda la relación entre serie, temporada, número de episodio y el `contentId` real del capítulo.
+- `getStreams` ahora solicita `startPlayVOD` con el ID del episodio y el ID de la serie por separado, y selecciona la mejor variante de vídeo disponible.
+
+**Validación:** sintaxis JavaScript y estructura ZIP verificadas. No se pudo hacer una prueba de reproducción contra el servicio remoto desde este entorno.

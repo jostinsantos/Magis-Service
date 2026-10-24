@@ -34,6 +34,8 @@ const inFlight = new Map();
 let rateQueue = Promise.resolve();
 const categoryKinds = new Map();
 const itemKinds = new Map();
+// Map parent-series + season/episode numbers to the portal's actual episode contentId.
+const episodeContentIds = new Map();
 const CACHE_TTL = { getHome: 5 * 60e3, getNextColumns: 5 * 60e3, 'v3/getShelveData': 3 * 60e3, 'v3/getRecommends': 10 * 60e3, 'v3/searchByName': 30e3, 'v4/getItemData': 10 * 60e3, 'v14/getSlbInfo': 10 * 60e3 };
 function cacheKey(path, bean) { return path + ':' + JSON.stringify(bean || {}); }
 async function cached(key, ttl, work) {
@@ -241,7 +243,7 @@ function normalizeRows(data, fallback, forcedType) {
     const r=rows[i]; if (!r || typeof r!=='object') continue;
     const title=rowName(r, `${fallback} ${i+1}`);
     const items=flattenItems(r, forcedType);
-    const id=String(r.columnId || r.id || r.recommendCode || r.columnCode || '');
+    const id=String(r.columnId || r.id || '');
     const code=String(r.columnCode || r.recommendCode || '');
     // A category row can be a navigation node without containing items yet.
     if (!items.length && !id && !code) continue;
@@ -366,8 +368,9 @@ async function getDiscoverFilters(filters) {
   for (let i=0;i<kinds.length;i++) {
     for (const row of rowsByKind[i]) {
       // Use the numeric columnId for getShelveData, while retaining the code map.
-      const id = String(row.id || row.code || '');
-      if (!id || seen.has(id)) continue;
+      const id = String(row.id || '');
+      // getShelveData expects columnId, not columnCode. Never expose a code as a selectable ID.
+      if (!/^\d+$/.test(id) || seen.has(id)) continue;
       seen.add(id);
       categoryKinds.set(id, kinds[i]);
       if (row.code) categoryKinds.set(String(row.code), kinds[i]);
@@ -384,7 +387,7 @@ async function getDiscover(options) {
   const requested = String(opts.type || opts.kind || 'movie').toLowerCase();
   const kind = requested.includes('anime') || requested.includes('anim') ? 'anime' : requested.includes('series') ? 'series' : requested.includes('all') ? 'all' : 'movies';
   const page = Math.max(1, parseInt(opts.page,10) || 1);
-  const pageSize = 40;
+  const pageSize = 20;
   let selected = String(opts.columnId || opts.categoryId || opts.category || opts.genre || opts.filter || '');
   if (selected === 'all' || selected === 'Todas las categorías') selected = '';
   if (selected && !opts.columnId && !opts.categoryId) {
@@ -394,10 +397,11 @@ async function getDiscover(options) {
     for (const k of searchKinds) {
       const rows = await categoryRows(k).catch(()=>[]);
       const found = rows.find(r => String(r.id) === selected || String(r.code) === selected || r.title === selected || r.name === selected);
-      if (found) { selected = String(found.id || found.code); categoryKinds.set(selected,k); break; }
+      if (found && /^\d+$/.test(String(found.id || ''))) { selected = String(found.id); categoryKinds.set(selected,k); break; }
     }
   }
   if (selected) {
+    if (!/^\d+$/.test(selected)) return {items:[],page,hasMore:false,total:0,error:'La categoría no contiene un columnId válido'};
     const mapped = categoryKinds.get(selected);
     const inferred = mapped || (kind === 'all' ? '' : kind);
     try {
@@ -409,8 +413,12 @@ async function getDiscover(options) {
         if (it.id) itemKinds.set(it.id,t);
         return Object.assign({},it,{type:t,media_type:t});
       });
-      const total = Number(data.assetListTotalSize || data.totalSize || data.total || items.length);
-      return {items,page,hasMore:total > 0 ? page*pageSize < total : items.length === pageSize,total};
+      const totalRaw = data.assetListTotalSize ?? data.listTotalSize ?? data.totalSize ?? data.total ?? data.count;
+      const total = Number(totalRaw || items.length);
+      const start=(page-1)*pageSize;
+      const pageItems=items.length > pageSize ? items.slice(start,start+pageSize) : items;
+      const hasMore = totalRaw != null ? page*pageSize < total : items.length >= pageSize;
+      return {items:pageItems,page,hasMore,total};
     } catch (_) { return {items:[],page,hasMore:false,total:0}; }
   }
   if (kind === 'all') {
@@ -430,8 +438,12 @@ async function getDiscover(options) {
       if (it.id) itemKinds.set(it.id,t);
       return Object.assign({},it,{type:t,media_type:t});
     });
-    const total = Number(data.assetListTotalSize || data.totalSize || data.total || items.length);
-    if (items.length || total) return {items,page,hasMore:total > 0 ? page*pageSize < total : items.length === pageSize,total};
+    const totalRaw = data.assetListTotalSize ?? data.listTotalSize ?? data.totalSize ?? data.total ?? data.count;
+    const total = Number(totalRaw || items.length);
+    const start=(page-1)*pageSize;
+    const pageItems=items.length > pageSize ? items.slice(start,start+pageSize) : items;
+    const hasMore = totalRaw != null ? page*pageSize < total : items.length >= pageSize;
+    if (items.length || total) return {items:pageItems,page,hasMore,total};
   } catch (_) {}
   // Last-resort fallback to already fetched Home rows; never make extra chains of calls.
   const rows = await homeRows(kind).catch(()=>[]);
@@ -467,14 +479,14 @@ function unwrapDetail(response) {
   }
   return data && typeof data === 'object' ? data : {};
 }
-function episodeRows(data, seriesId) {
+function episodeRows(data, seriesId, defaultSeason) {
   const raw = listFrom(data,['simpleProgramList','episodeList','episodes','programList','movieList','assetList']);
   return raw.map((ep,j)=>{
     const e=normalizeItem(ep);
     const number=Number(ep.seriesNumber || ep.episodeNum || ep.episodeNo || ep.episode || ep.number || j+1) || j+1;
     const id=String(ep.contentId || ep.id || ep.movieId || ep.assetId || '');
     if (!id) return null;
-    return {number, episode:number, id, contentId:id, title:String(ep.name || ep.viewPoint || ep.alias || ep.title || `Capítulo ${number}`), name:String(ep.name || ep.viewPoint || ep.alias || ep.title || `Capítulo ${number}`), overview:String(ep.description || ep.desc || ep.introduction || ''), description:String(ep.description || ep.desc || ep.introduction || ''), still:String(ep.poster || ep.posterUrl || e.poster || e.backdrop || ''), poster:String(ep.poster || ep.posterUrl || e.poster || ''), season:Number(ep.seasonNumber || ep.seasonNum || ep.season || 1) || 1, seriesContentId:String(ep.seriesContentId || seriesId || '')};
+    return {number, episode:number, id, contentId:id, title:String(ep.name || ep.viewPoint || ep.alias || ep.title || `Capítulo ${number}`), name:String(ep.name || ep.viewPoint || ep.alias || ep.title || `Capítulo ${number}`), overview:String(ep.description || ep.desc || ep.introduction || ''), description:String(ep.description || ep.desc || ep.introduction || ''), still:String(ep.poster || ep.posterUrl || e.poster || e.backdrop || ''), poster:String(ep.poster || ep.posterUrl || e.poster || ''), season:Number(ep.seasonNumber || ep.seasonNum || ep.season || defaultSeason || 1) || 1, seriesContentId:String(ep.seriesContentId || seriesId || '')};
   }).filter(Boolean);
 }
 async function getMeta(id, options) {
@@ -502,7 +514,9 @@ async function getMeta(id, options) {
     const merged = Object.assign({}, seed || {}, data);
     merged.contentId = String(data.contentId || data.id || contentId);
     if (!(data.name || data.title || data.viewPoint || data.alias) && seed) merged.name=seed.title || seed.name;
-    const simple = episodeRows(data,contentId);
+    const detailTitleForSeason = String(data.name || data.viewPoint || data.alias || data.title || '');
+    const defaultSeason = Number(data.seasonNumber || data.season || parseSeasonFromName(detailTitleForSeason) || 1) || 1;
+    const simple = episodeRows(data,contentId,defaultSeason);
     const ptype = String(data.programType || data.contentType || data.type || '').toLowerCase();
     const isSeries = ['teleplay','series','variety','0','tv'].includes(ptype) || fetchedType === '0' || simple.length > 1 || Array.isArray(data.sameSeasonSeriesList);
     const type = isSeries ? (knownType === 'anime' ? 'anime' : 'series') : 'movie';
@@ -517,7 +531,13 @@ async function getMeta(id, options) {
     const bySeason = new Map();
     for (const ep of simple) { const n=Number(ep.season || 1); if(!bySeason.has(n)) bySeason.set(n,[]); bySeason.get(n).push(ep); }
     const siblings = Array.isArray(data.sameSeasonSeriesList) ? data.sameSeasonSeriesList : [];
-    const currentSeason = Number(data.seasonNumber || data.season || parseSeasonFromName(item.title) || 1) || 1;
+    const currentSeason = Number(data.seasonNumber || data.season || parseSeasonFromName(item.title) || defaultSeason || 1) || 1;
+    if (isSeries) {
+      for (const ep of simple) {
+        const sn=Number(ep.season || currentSeason) || currentSeason;
+        episodeContentIds.set(`${contentId}:${sn}:${Number(ep.number)}`,String(ep.id));
+      }
+    }
     if (isSeries && !bySeason.has(currentSeason) && simple.length) bySeason.set(currentSeason,simple);
     const seasons=[];
     for (const [number, episodes] of Array.from(bySeason.entries()).sort((a,b)=>a[0]-b[0])) {
@@ -536,8 +556,9 @@ async function getMeta(id, options) {
       for (const link of links.slice(0,6)) {
         try {
           const sr=await api('v4/getItemData',{contentId:link.id,type:'0',sortType:'0',language:'en',macAddr:FIXED_MAC});
-          const sd=unwrapDetail(sr); const eps=episodeRows(sd,link.id);
+          const sd=unwrapDetail(sr); const eps=episodeRows(sd,link.id,link.number || Number(sd.seasonNumber || sd.season || parseSeasonFromName(link.name) || 1));
           const n=link.number || Number(sd.seasonNumber || sd.season || parseSeasonFromName(link.name) || seasons.length+1);
+          for (const ep of eps) episodeContentIds.set(`${item.id}:${n}:${Number(ep.number)}`,String(ep.id));
           const existing=seasons.find(x=>x.number===n);
           if(existing) { if(!existing.episodes.length) existing.episodes=eps; }
           else seasons.push({number:n,season:n,name:link.name || `Temporada ${n}`,title:link.name || `Temporada ${n}`,episodes:eps});
@@ -564,20 +585,50 @@ function parseSeasonFromName(name) {
   return m ? Number(m[1]) : 0;
 }
 async function getStreams(id, type, season, episode) {
-  const contentId = String(id && typeof id === 'object' ? (id.contentId || id.id || id.assetId) : id || '').trim();
-  if (!contentId) return [];
-  const itemTypeHint = String(type || (id && id.type) || itemKinds.get(contentId) || 'movie').toLowerCase();
-  const seriesContentId = itemTypeHint === 'series' || itemTypeHint === 'anime' ? String((id && id.seriesContentId) || contentId) : ''; 
-  const play = await api('v10/startPlayVOD',{contentId,seriesContentId,startTime:0,type:'1',columnId:0,authType:''});
-  let media = null;
-  const episodes = listFrom(play,['episodeList']);
-  if (episodes.length) {
-    const ep = episodes[0];
-    const groups = listFrom(ep,['totalMovieList']);
-    for (const g of groups) { const list = listFrom(g,['movieList']); if (list.length) { media = list[0]; break; } }
+  const parentId = String(id && typeof id === 'object' ? (id.contentId || id.id || id.assetId) : id || '').trim();
+  if (!parentId) return [];
+  const itemTypeHint = String(type || (id && id.type) || itemKinds.get(parentId) || 'movie').toLowerCase();
+  const isSeries = ['series','anime','tv','teleplay','0'].includes(itemTypeHint);
+  let playableId = parentId;
+  let seriesContentId = '';
+  if (isSeries) {
+    seriesContentId = String((id && id.seriesContentId) || parentId);
+    const sn = Number(season || 1) || 1;
+    const en = Number(episode || 1) || 1;
+    const key = `${seriesContentId}:${sn}:${en}`;
+    playableId = episodeContentIds.get(key) || '';
+    // If the host opened the episode from a restored/saved detail, rebuild the map on demand.
+    if (!playableId) {
+      try {
+        const meta = await getMeta(seriesContentId, {type:'series'});
+        const foundSeason = (meta && Array.isArray(meta.seasons) ? meta.seasons : []).find(x => Number(x.number) === sn);
+        const foundEpisode = foundSeason && Array.isArray(foundSeason.episodes) ? foundSeason.episodes.find(x => Number(x.number) === en) : null;
+        if (foundEpisode && foundEpisode.id) playableId = String(foundEpisode.id);
+      } catch (_) {}
+    }
+    if (!playableId) return [];
+    episodeContentIds.set(key, playableId);
   }
-  if (!media) media = listFrom(play,['mediaList','movieList'])[0] || (play.licenseList ? play : null);
-  if (!media) return [];
+  const play = await api('v10/startPlayVOD',{contentId:playableId,seriesContentId,type:'1',startTime:0,columnId:0,authType:''});
+  let mediaCandidates = [];
+  const episodeList = listFrom(play,['episodeList']);
+  if (episodeList.length) {
+    const wanted = Number(episode || 0);
+    let selectedEpisode = episodeList.find(ep => Number(ep.seriesNumber || ep.episodeNum || ep.episode || ep.number || 0) === wanted);
+    if (!selectedEpisode && playableId) selectedEpisode = episodeList.find(ep => String(ep.contentId || ep.id || '') === playableId);
+    if (!selectedEpisode) selectedEpisode = episodeList[0];
+    for (const group of listFrom(selectedEpisode,['totalMovieList'])) {
+      mediaCandidates.push(...listFrom(group,['movieList']));
+    }
+  }
+  if (!mediaCandidates.length) mediaCandidates = listFrom(play,['mediaList','movieList']);
+  if (!mediaCandidates.length && play && play.contentId && play.licenseList) mediaCandidates = [play];
+  if (!mediaCandidates.length) return [];
+  mediaCandidates.sort((a,b)=>{
+    const score=m=>(String(m.encodeFormat||'').toLowerCase()==='h264'?0:2)+(String(m.videoFormat||'').toLowerCase()==='mp4'?0:1);
+    return score(a)-score(b);
+  });
+  const media = mediaCandidates[0];
   const licenses = listFrom(media,['licenseList']);
   const license = licenses.length ? String(licenses[0].license || '') : '';
   if (!license) return [];
@@ -595,7 +646,9 @@ async function getStreams(id, type, season, episode) {
   if (!chosen) return [];
   const base = String(chosen.cdn.main_addr || '').replace(/\/$/,'');
   const ext = String(media.videoFormat || '').toLowerCase() === 'ts' ? 'ts' : 'mp4';
-  const url = `${base}/vod/${media.contentId || contentId}_media.${ext}`;
-  return [{name:'Magis Service',title:'Magis Service',url,quality:String(media.definition || media.resolution || 'Auto'),type:ext==='mp4'?'mp4':'ts',mimeType:ext==='mp4'?'video/mp4':'video/mp2t',headers:{'Content-Auth':String(chosen.u.url),'Content-License':license,'User-Agent':'Ranger/4.9.4-17294ac0','App':config().appId,'App-Version':config().apkVersion},language:'Español',isHls:false}];
+  const mediaId = String(media.contentId || playableId || parentId);
+  const url = `${base}/vod/${mediaId}_media.${ext}`;
+  return [{name:'Magis Service',title:'Magis Service',url,quality:String(media.definition || media.resolution || 'Auto'),type:ext,mimeType:ext==='mp4'?'video/mp4':'video/mp2t',headers:{'Content-Auth':String(chosen.u.url),'Content-License':license,'User-Agent':'Ranger/4.9.4-17294ac0','App':config().appId,'App-Version':config().apkVersion},language:'Español',isHls:false}];
 }
+
 module.exports = { getNews, getHome, getDiscoverFilters, getDiscover, getCatalog, search, getMeta, getStreams, getCatalogs };
