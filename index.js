@@ -41,9 +41,18 @@ function cacheKey(path, bean) { return path + ':' + JSON.stringify(bean || {}); 
 async function cached(key, ttl, work) {
   const now = Date.now(), hit = responseCache.get(key);
   if (hit && hit.expires > now) return hit.value;
+  if (hit) responseCache.delete(key);
   if (inFlight.has(key)) return inFlight.get(key);
   const task = Promise.resolve().then(work).then(value => {
-    if (ttl > 0) responseCache.set(key, {value, expires:Date.now()+ttl});
+    if (ttl > 0) {
+      responseCache.set(key, {value, expires:Date.now()+ttl});
+      // Prevent a long-lived app session/search history from growing the JS heap forever.
+      if (responseCache.size > 180) {
+        const t = Date.now();
+        for (const [k, v] of responseCache) if (v.expires <= t) responseCache.delete(k);
+        while (responseCache.size > 150) responseCache.delete(responseCache.keys().next().value);
+      }
+    }
     return value;
   }).finally(() => inFlight.delete(key));
   inFlight.set(key, task);
@@ -56,7 +65,7 @@ async function rateTurn() {
   rateQueue = new Promise(resolve => { release = resolve; });
   await previous;
   try {
-    const wait = Math.max(0, 400 - (Date.now() - lastCallAt));
+    const wait = Math.max(0, 250 - (Date.now() - lastCallAt));
     if (wait) await new Promise(resolve => setTimeout(resolve, wait));
     lastCallAt = Date.now();
   } finally { release(); }
@@ -310,12 +319,12 @@ function isAnime(item) {
   return /anime|animaci|donghua|masnew_anime/.test(text);
 }
 function itemType(item) { return item.type === 'anime' || isAnime(item) ? 'anime' : item.type === 'series' || item.programType === 'series' || item.programType === 'teleplay' || item.programType === '0' ? 'series' : 'movie'; }
-async function getNews() {
+async function _getNews() {
   const limit = Math.max(1, Math.min(20, parseInt(config().newsLimit,10) || 12));
   const items = await featured();
   return unique(items).slice(0, limit).map((it, i) => Object.assign({}, it, {section:'novedades', news:true, newsRank:i+1}));
 }
-async function getHome() {
+async function _getHome() {
   const kinds = ['movies','series','anime'];
   const results = await Promise.all(kinds.map(kind => homeRows(kind).catch(()=>[])));
   const rows = [];
@@ -356,7 +365,7 @@ async function categoryRows(kind) {
   categoryKindsFromRows(rows, kind);
   return rows.filter(r => r.id || r.code);
 }
-async function getDiscoverFilters(filters) {
+async function _getDiscoverFilters(filters) {
   const opts = filters && typeof filters === 'object' ? filters : {};
   const rawType = String(opts.type || opts.kind || 'movie').toLowerCase();
   const kind = rawType.includes('anime') || rawType.includes('anim') ? 'anime' : rawType.includes('series') ? 'series' : rawType.includes('all') ? 'all' : 'movies';
@@ -382,7 +391,7 @@ async function getDiscoverFilters(filters) {
     {id:'category',name:'Categoría',label:'Categoría',type:'select',options}
   ];
 }
-async function getDiscover(options) {
+async function _getDiscover(options) {
   const opts = options && typeof options === 'object' ? options : {};
   const requested = String(opts.type || opts.kind || 'movie').toLowerCase();
   const kind = requested.includes('anime') || requested.includes('anim') ? 'anime' : requested.includes('series') ? 'series' : requested.includes('all') ? 'all' : 'movies';
@@ -489,7 +498,7 @@ function episodeRows(data, seriesId, defaultSeason) {
     return {number, episode:number, id, contentId:id, title:String(ep.name || ep.viewPoint || ep.alias || ep.title || `Capítulo ${number}`), name:String(ep.name || ep.viewPoint || ep.alias || ep.title || `Capítulo ${number}`), overview:String(ep.description || ep.desc || ep.introduction || ''), description:String(ep.description || ep.desc || ep.introduction || ''), still:String(ep.poster || ep.posterUrl || e.poster || e.backdrop || ''), poster:String(ep.poster || ep.posterUrl || e.poster || ''), season:Number(ep.seasonNumber || ep.seasonNum || ep.season || defaultSeason || 1) || 1, seriesContentId:String(ep.seriesContentId || seriesId || '')};
   }).filter(Boolean);
 }
-async function getMeta(id, options) {
+async function _getMeta(id, options) {
   const opts = options && typeof options === 'object' ? options : (typeof options === 'string' ? {type:options} : {});
   const contentId = String(id && typeof id === 'object' ? (id.contentId || id.id || id.assetId || id.programId) : id || '').trim();
   if (!contentId) return null;
@@ -584,7 +593,7 @@ function parseSeasonFromName(name) {
   const m=String(name||'').match(/(?:temporada|season|temp\.?|\bT|\bS)\s*(\d+)/i);
   return m ? Number(m[1]) : 0;
 }
-async function getStreams(id, type, season, episode) {
+async function _getStreams(id, type, season, episode) {
   const parentId = String(id && typeof id === 'object' ? (id.contentId || id.id || id.assetId) : id || '').trim();
   if (!parentId) return [];
   const itemTypeHint = String(type || (id && id.type) || itemKinds.get(parentId) || 'movie').toLowerCase();
@@ -649,6 +658,34 @@ async function getStreams(id, type, season, episode) {
   const mediaId = String(media.contentId || playableId || parentId);
   const url = `${base}/vod/${mediaId}_media.${ext}`;
   return [{name:'Magis Service',title:'Magis Service',url,quality:String(media.definition || media.resolution || 'Auto'),type:ext,mimeType:ext==='mp4'?'video/mp4':'video/mp2t',headers:{'Content-Auth':String(chosen.u.url),'Content-License':license,'User-Agent':'Ranger/4.9.4-17294ac0','App':config().appId,'App-Version':config().apkVersion},language:'Español',isHls:false}];
+}
+
+// Public-call cache: repeated widget rebuilds / tab switches reuse the same work instead
+// of launching overlapping API chains. The underlying feature implementations stay intact.
+async function getNews() {
+  return cached('public:getNews', 120e3, () => _getNews());
+}
+async function getHome() {
+  return cached('public:getHome', 60e3, () => _getHome());
+}
+async function getDiscoverFilters(filters) {
+  const opts = filters && typeof filters === 'object' ? filters : {};
+  const type = String(opts.type || opts.kind || 'movie').toLowerCase();
+  return cached('public:getDiscoverFilters:' + type, 10 * 60e3, () => _getDiscoverFilters(opts));
+}
+async function getDiscover(options) {
+  const opts = options && typeof options === 'object' ? options : {};
+  return cached('public:getDiscover:' + JSON.stringify(opts), 45e3, () => _getDiscover(opts));
+}
+async function getMeta(id, options) {
+  const keyId = id && typeof id === 'object' ? (id.contentId || id.id || id.assetId || id.programId || JSON.stringify(id)) : String(id || '');
+  const opts = options && typeof options === 'object' ? options : (typeof options === 'string' ? {type:options} : {});
+  return cached('public:getMeta:' + String(keyId) + ':' + JSON.stringify(opts), 5 * 60e3, () => _getMeta(id, opts));
+}
+async function getStreams(id, type, season, episode) {
+  const keyId = id && typeof id === 'object' ? (id.contentId || id.id || id.assetId || JSON.stringify(id)) : String(id || '');
+  const key = ['public:getStreams', keyId, type || '', season || '', episode || ''].join(':');
+  return cached(key, 20e3, () => _getStreams(id, type, season, episode));
 }
 
 module.exports = { getNews, getHome, getDiscoverFilters, getDiscover, getCatalog, search, getMeta, getStreams, getCatalogs };

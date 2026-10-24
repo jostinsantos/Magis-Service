@@ -72,3 +72,13 @@ La validación local comprueba sintaxis y empaquetado. La respuesta real depende
 - `getStreams` ahora solicita `startPlayVOD` con el ID del episodio y el ID de la serie por separado, y selecciona la mejor variante de vídeo disponible.
 
 **Validación:** sintaxis JavaScript y estructura ZIP verificadas. No se pudo hacer una prueba de reproducción contra el servicio remoto desde este entorno.
+
+
+## Optimización 1.5.0 (sin retirar funciones)
+- Añade caché de nivel público para Home, novedades, filtros, páginas de Descubrir, fichas y servidores; evita repetir cadenas de llamadas cuando la UI reconstruye widgets o cambia de pestaña.
+- Comparte solicitudes simultáneas de la misma clave para reducir duplicados.
+- Limita la memoria de caché y elimina entradas caducadas cuando crece, para evitar acumulación indefinida durante sesiones largas.
+- Ajusta la separación mínima entre peticiones de 400 ms a 250 ms, manteniendo el orden de la cola para no disparar llamadas concurrentes al portal.
+- Mantiene las funciones de catálogo, filtros, fichas, temporadas, episodios y reproducción.
+
+**Nota:** esta optimización reduce trabajo repetido del repositorio, pero no puede garantizar por sí sola eliminar el diálogo Android «La app no responde». Si persiste incluso con menos llamadas, el bloqueo puede estar en el runtime JavaScript/puente HTTP de la app anfitriona y requerir mover esa ejecución fuera del hilo principal.
