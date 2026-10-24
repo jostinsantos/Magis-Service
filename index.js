@@ -25,9 +25,39 @@ const FIXED_MAC = '02:00:00:00:00:00';
 const HOME = { movies: 'masnew_movies', series: 'masnew_series', anime: 'masnew_anime', featured: 'masnew_featured' };
 const ROOT = { movies: '76263', series: '76235', anime: '76209' };
 let session = null;
+let sessionPromise = null;
 let preferredHost = null;
 let lastCallAt = 0;
 let slbCache = null;
+const responseCache = new Map();
+const inFlight = new Map();
+let rateQueue = Promise.resolve();
+const categoryKinds = new Map();
+const CACHE_TTL = { getHome: 5 * 60e3, getNextColumns: 5 * 60e3, 'v3/getShelveData': 3 * 60e3, 'v3/getRecommends': 10 * 60e3, 'v3/searchByName': 30e3, 'v4/getItemData': 10 * 60e3, 'v14/getSlbInfo': 10 * 60e3 };
+function cacheKey(path, bean) { return path + ':' + JSON.stringify(bean || {}); }
+async function cached(key, ttl, work) {
+  const now = Date.now(), hit = responseCache.get(key);
+  if (hit && hit.expires > now) return hit.value;
+  if (inFlight.has(key)) return inFlight.get(key);
+  const task = Promise.resolve().then(work).then(value => {
+    if (ttl > 0) responseCache.set(key, {value, expires:Date.now()+ttl});
+    return value;
+  }).finally(() => inFlight.delete(key));
+  inFlight.set(key, task);
+  return task;
+}
+function timeoutError(e) { const m = String(e && (e.name || e.message) || e).toLowerCase(); return m.includes('abort') || m.includes('timeout'); }
+async function rateTurn() {
+  let release;
+  const previous = rateQueue;
+  rateQueue = new Promise(resolve => { release = resolve; });
+  await previous;
+  try {
+    const wait = Math.max(0, 400 - (Date.now() - lastCallAt));
+    if (wait) await new Promise(resolve => setTimeout(resolve, wait));
+    lastCallAt = Date.now();
+  } finally { release(); }
+}
 
 function config() {
   let supplied = {};
@@ -78,10 +108,7 @@ function hardwareFingerprint() {
     serialNumber:randHex(8), tags:'release-keys', verId:'', wifiMac:randMac() };
 }
 async function portal(path, bean, baseFields = true) {
-  const now = Date.now();
-  const wait = Math.max(0, 400 - (now - lastCallAt));
-  if (wait) await new Promise(resolve => setTimeout(resolve, wait));
-  lastCallAt = Date.now();
+  await rateTurn();
   const c = config();
   const body = Object.assign({}, baseFields ? {portalCode:PORTAL_CODE,userId:session?.userId || '',userToken:session?.userToken || ''} : {}, bean || {}, deviceDict());
   const wire = encryptBody(JSON.stringify(body));
@@ -89,12 +116,12 @@ async function portal(path, bean, baseFields = true) {
   const hosts = preferredHost ? [preferredHost, ...c.hosts.filter(h => h !== preferredHost)] : c.hosts;
   for (const host of hosts) {
     try {
-      const response = await fetch(`${c.scheme}://${host}/api/portalCore/${path}`, {
-        method:'POST', headers:{'Content-Type':'application/json; charset=utf-8','apk':c.appId,'apkVer':API_VERSION,'spkgVer':SPKG_VERSION,'User-Agent':'okhttp/3.12.12'},
-        body:wire
-      });
+      const opts = { method:'POST', headers:{'Content-Type':'application/json; charset=utf-8','apk':c.appId,'apkVer':API_VERSION,'spkgVer':SPKG_VERSION,'User-Agent':'okhttp/3.12.12'}, body:wire };
+      // The host runtime supports AbortSignal.timeout. A short deadline prevents a dead portal from holding the Home open.
+      if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') opts.signal = AbortSignal.timeout(7000);
+      const response = await fetch(`${c.scheme}://${host}/api/portalCore/${path}`, opts);
       if (!response.ok) { lastError = `HTTP ${response.status}`; continue; }
-      let json = await response.json();
+      const json = await response.json();
       const code = String(json.returnCode ?? '');
       if (code && code !== '0') throw new Error(String(json.errorMessage || json.msg || `Portal ${code}`));
       preferredHost = host;
@@ -103,45 +130,61 @@ async function portal(path, bean, baseFields = true) {
         try { data = JSON.parse(decryptBlob(data)); } catch (_) { /* some responses are already plain */ }
       }
       return data && typeof data === 'object' ? data : json;
-    } catch (e) { lastError = String(e && e.message || e); }
+    } catch (e) {
+      lastError = String(e && e.message || e);
+      // Aborting the request is only a client-side deadline in some runtimes; don't launch another request while the first is still pending.
+      if (timeoutError(e)) break;
+    }
   }
   throw new Error(`${path}: ${lastError}`);
 }
 async function ensureSession() {
   if (session && session.userToken) return;
-  if (typeof CryptoJS === 'undefined') throw new Error('El runtime no ha cargado CryptoJS; revisa que index.js incluya la palabra CryptoJS.');
-  const tokenResponse = await portal('v3/snToken', hardwareFingerprint(), false);
-  const snToken = String(tokenResponse.snToken || '');
-  if (!snToken) throw new Error('El servicio no devolvió snToken');
-  const sn = String(tokenResponse.sn || md5(snToken + SN_SALT)).toLowerCase();
-  session = {sn, userId:'', userToken:'', jwtToken:''};
-  const active = await portal('v8/active', {snToken,authVersion:'',authCode:'',preCode:'',macAddr:FIXED_MAC,
-    reserve1:'',openNum:4,channel:'default',matadata:'',signdata:''}, false);
-  if (!active.userToken) throw new Error('La activación no devolvió userToken');
-  session.userId = String(active.userId || '');
-  session.userToken = String(active.userToken || '');
-  session.jwtToken = String(active.jwtToken || '');
+  if (sessionPromise) return sessionPromise;
+  sessionPromise = (async () => {
+    if (typeof CryptoJS === 'undefined') throw new Error('El runtime no ha cargado CryptoJS; revisa que index.js incluya la palabra CryptoJS.');
+    const tokenResponse = await portal('v3/snToken', hardwareFingerprint(), false);
+    const snToken = String(tokenResponse.snToken || '');
+    if (!snToken) throw new Error('El servicio no devolvió snToken');
+    const sn = String(tokenResponse.sn || md5(snToken + SN_SALT)).toLowerCase();
+    session = {sn, userId:'', userToken:'', jwtToken:''};
+    const active = await portal('v8/active', {snToken,authVersion:'',authCode:'',preCode:'',macAddr:FIXED_MAC,
+      reserve1:'',openNum:4,channel:'default',matadata:'',signdata:''}, false);
+    if (!active.userToken) { session = null; throw new Error('La activación no devolvió userToken'); }
+    session.userId = String(active.userId || '');
+    session.userToken = String(active.userToken || '');
+    session.jwtToken = String(active.jwtToken || '');
+  })();
+  try { await sessionPromise; } finally { sessionPromise = null; }
 }
-async function api(path, bean) { await ensureSession(); return portal(path, bean, true); }
+async function api(path, bean) {
+  const ttl = CACHE_TTL[path] || 0;
+  if (!ttl) { await ensureSession(); return portal(path, bean, true); }
+  return cached(cacheKey(path, bean), ttl, async () => { await ensureSession(); return portal(path, bean, true); });
+}
 function listFrom(o, keys) { for (const k of keys) if (o && Array.isArray(o[k])) return o[k]; return []; }
-function flattenItems(data) {
-  if (Array.isArray(data)) return data.filter(x => x && typeof x === 'object').map(normalizeItem);
+function flattenItems(data, forcedType) {
   if (!data || typeof data !== 'object') return [];
-  const direct = listFrom(data, ['assetList','itemList','list','programList','contentList','results','items']);
-  if (direct.length) return direct.filter(x => x && typeof x === 'object').map(normalizeItem);
-  const groups = listFrom(data, ['searchItemList','recommendList','columnList','homeColumnList','rowList']);
+  if (!Array.isArray(data) && data.data && typeof data.data === 'object' && !Array.isArray(data.assetList) && !Array.isArray(data.columnList)) {
+    const nested = flattenItems(data.data, forcedType); if (nested.length) return nested;
+  }
+  if (Array.isArray(data)) return data.filter(x => x && typeof x === 'object').map(x => normalizeItem(x, forcedType));
+  for (const key of ['assetList','itemList','contentList','movieList','programList','list','results','items']) {
+    if (Array.isArray(data[key])) return data[key].filter(x => x && typeof x === 'object').map(x => normalizeItem(x, forcedType));
+  }
+  const groups = listFrom(data, ['searchItemList','recommendList','columnList','homeColumnList','rowList','columns','childColumnList','nextColumnList']);
   const out = [];
   for (const g of groups) {
     if (!g || typeof g !== 'object') continue;
-    const nested = listFrom(g, ['itemList','assetList','contentList','list']);
-    out.push(...nested.filter(x => x && typeof x === 'object').map(normalizeItem));
+    const nested = flattenItems(g, forcedType);
+    out.push(...nested);
   }
   return out;
 }
-function normalizeItem(raw) {
+function normalizeItem(raw, forcedType) {
   const images = Array.isArray(raw.posterList || raw.posters || raw.imageList) ? (raw.posterList || raw.posters || raw.imageList) : [];
   let poster = raw.poster || raw.posterUrl || raw.pic || raw.cover || raw.image || '';
-  let backdrop = raw.backdrop || raw.backdropUrl || '';
+  let backdrop = raw.backdrop || raw.backdropUrl || raw.background || '';
   for (const img of images) {
     if (!img || typeof img !== 'object') continue;
     const kind = String(img.fileType || img.type || '').toLowerCase();
@@ -151,130 +194,216 @@ function normalizeItem(raw) {
     if (!backdrop && kind === 'poster') backdrop = url;
     if (!poster) poster = url;
   }
-  const programType = String(raw.programType || raw.type || raw.contentType || 'movie').toLowerCase();
-  const type = ['teleplay','series','variety','0'].includes(programType) ? 'series' : (String(raw.type) === 'anime' ? 'anime' : 'movie');
+  const programType = String(raw.programType || raw.contentType || raw.type || 'movie').toLowerCase();
+  let type = forcedType || (['teleplay','series','variety','0'].includes(programType) ? 'series' : 'movie');
+  if (type === 'movies') type = 'movie'; if (type === 'animation') type = 'anime';
   const name = String(raw.name || raw.viewPoint || raw.alias || raw.title || raw.contentId || raw.id || 'Sin título');
-  const release = String(raw.releaseTime || raw.year || '');
+  const release = String(raw.releaseTime || raw.year || raw.releaseDate || '');
+  const genres = raw.genres || raw.genreList || raw.categoryList || raw.categoryName || raw.genre || [];
   const item = Object.assign({}, raw, {
-    id:String(raw.contentId || raw.id || ''), contentId:String(raw.contentId || raw.id || ''),
-    title:name, name, type, year:/^\d{4}/.test(release) ? release.slice(0,4) : release,
-    poster, image:poster, backdrop, description:String(raw.description || raw.desc || raw.introduction || ''),
-    programType: type === 'series' ? 'series' : 'movie'
+    id:String(raw.contentId || raw.id || raw.assetId || ''), contentId:String(raw.contentId || raw.id || raw.assetId || ''),
+    title:name, name, type, media_type:type, year:/^\d{4}/.test(release) ? release.slice(0,4) : release,
+    poster, image:poster, backdrop, background:backdrop,
+    description:String(raw.description || raw.desc || raw.introduction || raw.summary || raw.plot || ''),
+    overview:String(raw.description || raw.desc || raw.introduction || raw.summary || raw.plot || ''),
+    genres:Array.isArray(genres) ? genres.map(g => typeof g === 'object' ? String(g.name || g.title || '') : String(g)).filter(Boolean) : String(genres || '').split(/[,|;]/).map(x=>x.trim()).filter(Boolean),
+    programType: type === 'series' ? 'series' : type === 'anime' ? (programType || 'anime') : 'movie'
   });
+  if (raw.score != null && item.rating == null) item.rating = Number(raw.score) || null;
   return item;
 }
 function rowName(row, fallback) { return String(row.name || row.columnName || row.title || row.recommendName || fallback); }
-function normalizeRows(data, fallback) {
-  let rows = listFrom(data, ['columnList','homeColumnList','rowList','list','data']);
+function normalizeRows(data, fallback, forcedType) {
+  if (data && data.data && typeof data.data === 'object' && !Array.isArray(data.data)) data = data.data;
+  let rows = listFrom(data, ['columnList','homeColumnList','rowList','list','columns','childColumnList','nextColumnList','columnInfoList']);
   if (!rows.length && data && typeof data === 'object' && Array.isArray(data.recommendList)) rows = data.recommendList;
-  if (!rows.length) {
-    const items = flattenItems(data);
-    return items.length ? [{id:String(data.columnId || ''), title:fallback, name:fallback, items}] : [];
+  if (!rows.length && data && typeof data === 'object' && Array.isArray(data.assetList)) {
+    const items = flattenItems(data, forcedType);
+    return items.length ? [{id:String(data.columnId || ''), code:String(data.columnCode || ''), title:rowName(data, fallback), name:rowName(data, fallback), items}] : [];
   }
-  return rows.map((r, i) => ({ id:String(r.columnId || r.id || r.recommendCode || ''), code:String(r.columnCode || r.recommendCode || ''),
-    title:rowName(r, `${fallback} ${i+1}`), name:rowName(r, `${fallback} ${i+1}`), items:flattenItems(r) })).filter(r => r.items.length);
+  if (!rows.length) {
+    const items = flattenItems(data, forcedType);
+    return items.length ? [{id:String(data.columnId || ''),code:String(data.columnCode || ''),title:fallback,name:fallback,items}] : [];
+  }
+  const out = [];
+  for (let i=0;i<rows.length;i++) {
+    const r=rows[i]; if (!r || typeof r!=='object') continue;
+    const title=rowName(r, `${fallback} ${i+1}`);
+    const items=flattenItems(r, forcedType);
+    if (!items.length) continue;
+    out.push({id:String(r.columnId || r.id || r.recommendCode || r.columnCode || ''), code:String(r.columnCode || r.recommendCode || ''), title, name:title, items});
+  }
+  return out;
 }
 function unique(items) { const seen = new Set(); return items.filter(it => { const id = String(it.contentId || it.id || it.title); if (!id || seen.has(id)) return false; seen.add(id); return true; }); }
 async function homeRows(kind) {
   const code = HOME[kind] || HOME.movies;
-  try { const data = await api('getHome', {homePageCode:code,version:''}); const rows = normalizeRows(data, kindLabel(kind)); if (rows.length) return rows; } catch (_) {}
-  try { const data = await api('getNextColumns', {columnCode:code,pageNum:1,pageSize:50,version:''}); const rows = normalizeRows(data, kindLabel(kind)); if (rows.length) return rows; } catch (_) {}
-  const rootId = ROOT[kind] || ROOT.movies;
-  try { const data = await api('v3/getShelveData', {columnId:rootId,columnType:'2',pageNum:1,pageSize:40,encryptVersion:0}); const items = flattenItems(data); if (items.length) return [{id:rootId,code,title:kindLabel(kind),name:kindLabel(kind),items}]; } catch (_) {}
-  return [];
+  const forcedType = kind === 'series' ? 'series' : kind === 'anime' ? 'anime' : 'movie';
+  return cached('homeRows:'+kind, CACHE_TTL.getHome, async () => {
+    // First try the actual Home endpoint. Only fall back when it returns an empty shape,
+    // not when a request times out, to avoid multiplying stalled network requests.
+    try {
+      const data = await api('getHome', {homePageCode:code,version:''});
+      const rows = normalizeRows(data, kindLabel(kind), forcedType);
+      if (rows.length) { categoryKindsFromRows(rows, kind); return rows; }
+    } catch (e) { if (timeoutError(e)) return []; }
+    try {
+      const data = await api('getNextColumns', {columnCode:code,pageNum:1,pageSize:30,version:''});
+      const rows = normalizeRows(data, kindLabel(kind), forcedType);
+      if (rows.length) { categoryKindsFromRows(rows, kind); return rows; }
+    } catch (e) { if (timeoutError(e)) return []; }
+    // Final fallback mirrors MagisService.loadHomeRows: query the known root shelf.
+    try {
+      const rootId=ROOT[kind] || ROOT.movies;
+      const data=await api('v3/getShelveData',{columnId:rootId,columnType:'2',pageNum:1,pageSize:30,encryptVersion:0});
+      const items=flattenItems(data,forcedType);
+      if(items.length) return [{id:rootId,code,title:kindLabel(kind),name:kindLabel(kind),items}];
+    } catch (_) {}
+    return [];
+  });
+}
+function categoryKindsFromRows(rows, kind) {
+  for (const row of rows) {
+    if (row.id) categoryKinds.set(String(row.id), kind);
+    if (row.code) categoryKinds.set(String(row.code), kind);
+  }
 }
 function kindLabel(kind) { return kind === 'series' ? 'Series' : kind === 'anime' ? 'Animación' : 'Películas'; }
 async function featured() {
-  try {
-    const data = await api('v3/getRecommends', {recommendCodeArr:Array.from({length:6},(_,i)=>`masnew_featured${String(i+1).padStart(2,'0')}`)});
-    const items = unique(flattenItems(data)); if (items.length) return items;
-  } catch (_) {}
-  const rows = await homeRows('movies');
-  const series = await homeRows('series');
-  return unique([...rows.flatMap(r=>r.items), ...series.flatMap(r=>r.items)]).slice(0,20);
+  return cached('featured-items', CACHE_TTL['v3/getRecommends'], async () => {
+    try {
+      const data = await api('v3/getRecommends', {recommendCodeArr:Array.from({length:6},(_,i)=>`masnew_featured${String(i+1).padStart(2,'0')}`)});
+      const items = unique(flattenItems(data));
+      if (items.length) return items;
+    } catch (_) {}
+    // Do not start extra network calls here; use already-loaded Home data only.
+    let cachedMovies = responseCache.get('homeRows:movies')?.value || [];
+    let cachedSeries = responseCache.get('homeRows:series')?.value || [];
+    // When the launcher requests news before Home, make one bounded fallback request.
+    if (!cachedMovies.length) cachedMovies = await homeRows('movies').catch(()=>[]);
+    if (!cachedSeries.length && cachedMovies.flatMap(r=>r.items).length < 8) cachedSeries = await homeRows('series').catch(()=>[]);
+    return unique([...cachedMovies.flatMap(r=>r.items), ...cachedSeries.flatMap(r=>r.items)]).slice(0,20);
+  });
 }
 function isAnime(item) {
   const text = `${item.type||''} ${item.programType||''} ${item.name||''} ${item.category||''} ${item.columnName||''}`.toLowerCase();
   return /anime|animaci|donghua|masnew_anime/.test(text);
 }
-function itemType(item) { return isAnime(item) ? 'anime' : item.type === 'series' || item.programType === 'series' ? 'series' : 'movie'; }
-
+function itemType(item) { return item.type === 'anime' || isAnime(item) ? 'anime' : item.type === 'series' || item.programType === 'series' || item.programType === 'teleplay' || item.programType === '0' ? 'series' : 'movie'; }
 async function getNews() {
-  const limit = Math.max(1, Math.min(50, parseInt(config().newsLimit,10) || 12));
+  const limit = Math.max(1, Math.min(20, parseInt(config().newsLimit,10) || 12));
   const items = await featured();
   return unique(items).slice(0, limit).map((it, i) => Object.assign({}, it, {section:'novedades', news:true, newsRank:i+1}));
 }
 async function getHome() {
+  const kinds = ['movies','series','anime'];
+  const results = await Promise.all(kinds.map(kind => homeRows(kind).catch(()=>[])));
   const rows = [];
-  for (const kind of ['movies','series','anime']) {
-    const found = await homeRows(kind);
-    for (const row of found) rows.push(Object.assign({}, row, {type:kind === 'movies' ? 'movie' : kind, categoryType:kind, category:row.title}));
+  for (let i=0;i<kinds.length;i++) {
+    const kind=kinds[i];
+    for (const row of results[i]) rows.push(Object.assign({}, row, {type:'row',categoryType:kind === 'movies' ? 'movie' : kind,category:row.title,imageStyle:'poster'}));
   }
-  // Novedades es una fila propia; no fusionarla con las filas de cada tipo.
+  // Keep news as its own row; never merge it with the movie/series/anime carousels.
   const news = await getNews().catch(()=>[]);
-  if (news.length) rows.unshift({id:'novedades',code:'novedades',title:'Novedades',name:'Novedades',type:'news',categoryType:'news',items:news});
+  if (news.length) rows.unshift({id:'novedades',code:'novedades',title:'Novedades',name:'Novedades',type:'hero',imageStyle:'backdrop',items:news});
   return rows;
 }
 async function getCatalogs() {
   return [
-    {id:'peliculas', name:'Películas', type:'movie', kinds:['movie'], extra:{kind:'movies'}},
-    {id:'series', name:'Series', type:'series', kinds:['series'], extra:{kind:'series'}},
-    {id:'animacion', name:'Animación', type:'anime', kinds:['anime'], extra:{kind:'anime'}}
+    {id:'peliculas', title:'Películas', name:'Películas', type:'movie', kinds:['movie'], extra:{kind:'movies'}},
+    {id:'series', title:'Series', name:'Series', type:'series', kinds:['series'], extra:{kind:'series'}},
+    {id:'animacion', title:'Animación', name:'Animación', type:'anime', kinds:['anime'], extra:{kind:'anime'}}
   ];
 }
+async function getCatalog(catalogId, options) {
+  const id=String(catalogId || '').toLowerCase();
+  const opts=options && typeof options==='object' ? options : {};
+  const kind=id.includes('anime') || id.includes('anim') ? 'anime' : id.includes('series') ? 'series' : 'movies';
+  return getDiscover(Object.assign({}, opts, {kind}));
+}
 async function getDiscoverFilters() {
+  const kinds=['movies','series','anime'];
+  const results=await Promise.all(kinds.map(kind=>homeRows(kind).catch(()=>[])));
+  const options=[{id:'all',label:'Todas las categorías'}];
+  const seen=new Set(['all']);
+  for(let i=0;i<kinds.length;i++) {
+    for(const row of results[i]) {
+      const id=String(row.id || row.code || '');
+      if(!id || seen.has(id)) continue;
+      seen.add(id); categoryKinds.set(id,kinds[i]);
+      options.push({id,label:row.title || row.name || kindLabel(kinds[i])});
+    }
+  }
   return [
-    {id:'type', name:'Tipo', type:'select', options:[{id:'movie',label:'Películas'},{id:'series',label:'Series'},{id:'anime',label:'Animación'}]},
-    {id:'category', name:'Categoría', type:'select', options:[]}
+    {id:'type',name:'Tipo',label:'Tipo',type:'select',options:[{id:'movie',label:'Películas'},{id:'series',label:'Series'},{id:'anime',label:'Animación'}]},
+    {id:'category',name:'Categoría',label:'Categoría',type:'select',options}
   ];
 }
 async function getDiscover(options) {
-  const opts = options && typeof options === 'object' ? options : {};
-  const requested = String(opts.type || opts.kind || opts.filter || opts.genre || 'movie').toLowerCase();
-  const kind = requested.includes('anime') || requested.includes('anim') ? 'anime' : requested.includes('series') ? 'series' : 'movies';
-  const page = Math.max(1, parseInt(opts.page,10) || 1);
-  const columnId = String(opts.columnId || opts.categoryId || '');
+  const opts=options && typeof options==='object' ? options : {};
+  const requested=String(opts.type || opts.kind || 'movie').toLowerCase();
+  let kind=requested.includes('anime') || requested.includes('anim') ? 'anime' : requested.includes('series') ? 'series' : requested.includes('all') ? 'all' : 'movies';
+  let columnId=String(opts.columnId || opts.categoryId || '');
+  const category=String(opts.category || '');
+  if (!columnId && category && category !== 'all') columnId=category;
   if (columnId) {
-    const data = await api('v3/getShelveData', {columnId,columnType:'2',pageNum:page,pageSize:40,encryptVersion:0});
-    const items = flattenItems(data);
-    const total = Number(data.assetListTotalSize || data.totalSize || data.total || items.length);
-    return {items:items.map(it=>Object.assign(it,{type:itemType(it)})),page,hasMore:page*40<total,total};
+    const mapped=categoryKinds.get(columnId);
+    try {
+      const data=await api('v3/getShelveData',{columnId,columnType:'2',pageNum:Math.max(1,parseInt(opts.page,10)||1),pageSize:40,encryptVersion:0});
+      const items=flattenItems(data, mapped==='anime'?'anime':undefined).map(it=>Object.assign(it,{type:mapped==='anime'?'anime':itemType(it)}));
+      const total=Number(data.assetListTotalSize || data.totalSize || data.total || items.length);
+      return {items,page:Math.max(1,parseInt(opts.page,10)||1),hasMore:(Math.max(1,parseInt(opts.page,10)||1)*40)<total,total};
+    } catch (_) { return {items:[],page:Math.max(1,parseInt(opts.page,10)||1),hasMore:false,total:0}; }
   }
-  const rows = await homeRows(kind);
-  const all = unique(rows.flatMap(r=>r.items)).map(it=>Object.assign(it,{type:itemType(it)}));
-  const start = (page-1)*40;
+  let kinds=kind==='all'?['movies','series','anime']:[kind];
+  const results=await Promise.all(kinds.map(k=>homeRows(k).catch(()=>[])));
+  const rows=results.flat();
+  const all=unique(rows.flatMap(r=>r.items)).map(it=>Object.assign({},it,{type:kind==='all'?itemType(it):kind==='anime'?'anime':itemType(it)}));
+  const page=Math.max(1,parseInt(opts.page,10)||1), start=(page-1)*40;
   return {items:all.slice(start,start+40),page,hasMore:start+40<all.length,total:all.length,categories:rows.map(r=>({id:r.id,name:r.name,code:r.code}))};
 }
 async function search(query, options) {
-  const q = String(query || '').trim(); if (!q) return [];
-  const opts = options && typeof options === 'object' ? options : {};
-  const page = Math.max(1, parseInt(opts.page,10) || 1);
-  const requested = String(opts.type || '').toLowerCase();
-  if (requested === 'anime' || requested === 'animacion' || requested === 'animation') {
-    const r = await api('v3/searchByName',{value:q,type:'0',columnId:'',filter:'',pageNum:page,pageSize:20});
-    return unique(flattenItems(r)).filter(it=>isAnime(it)).map(it=>Object.assign(it,{type:'anime'}));
-  }
-  const types = requested === 'movie' || requested === 'movies' ? ['1'] : requested === 'series' ? ['0'] : ['1','0'];
-  const out = [];
-  for (const t of types) {
-    try { const r = await api('v3/searchByName',{value:q,type:t,columnId:'',filter:'',pageNum:page,pageSize:20}); out.push(...flattenItems(r)); } catch (_) {}
-  }
-  return unique(out).map(it=>Object.assign(it,{type:itemType(it)}));
+  const q=String(query || '').trim(); if(!q) return [];
+  const opts=options && typeof options==='object'?options:{};
+  const page=Math.max(1,parseInt(opts.page,10)||1);
+  const requested=String(opts.type || '').toLowerCase();
+  return cached('search:'+q.toLowerCase()+':'+requested+':'+page,30e3,async()=>{
+    const find=async type=>unique(flattenItems(await api('v3/searchByName',{value:q,type,columnId:'',filter:'',pageNum:page,pageSize:20})));
+    if(requested==='anime'||requested==='animacion'||requested==='animation') {
+      try { return (await find('0')).filter(it=>isAnime(it)).map(it=>Object.assign(it,{type:'anime'})); } catch (_) { return []; }
+    }
+    if(requested==='movie'||requested==='movies') { try { return (await find('1')).map(it=>Object.assign(it,{type:'movie'})); } catch (_) { return []; } }
+    if(requested==='series') { try { return (await find('0')).map(it=>Object.assign(it,{type:'series'})); } catch (_) { return []; } }
+    const results=await Promise.all([find('1').catch(()=>[]),find('0').catch(()=>[])]);
+    return unique([...results[0],...results[1]]).map(it=>Object.assign(it,{type:itemType(it)}));
+  });
 }
 async function getMeta(id, options) {
-  const opts = options && typeof options === 'object' ? options : {};
-  const contentId = String(id && typeof id === 'object' ? (id.contentId || id.id) : id || '').trim();
-  if (!contentId) return null;
-  const seed = id && typeof id === 'object' ? normalizeItem(id) : null;
-  let type = String(opts.type || (seed && seed.type === 'series' ? '0' : '1'));
-  if (type === 'movie') type = '1'; if (type === 'series' || type === 'anime') type = '0';
-  const data = await api('v4/getItemData',{contentId,type,sortType:'0',language:'en',macAddr:FIXED_MAC});
-  const item = normalizeItem(Object.assign({}, seed || {}, data, {contentId, id:contentId}));
-  item.details = data;
-  item.seasons = listFrom(data,['seasonList','seasons','seriesList']);
-  item.episodes = listFrom(data,['episodeList','episodes','movieList']);
-  item.type = type === '0' ? (seed && seed.type === 'anime' ? 'anime' : 'series') : 'movie';
-  return item;
+  const opts=options && typeof options==='object'?options:{};
+  const contentId=String(id && typeof id==='object'?(id.contentId||id.id):id||'').trim();
+  if(!contentId) return null;
+  const seed=id && typeof id==='object'?normalizeItem(id):null;
+  let type=String(opts.type || (seed && (seed.type==='series'||seed.type==='anime')?'0':'1'));
+  if(type==='movie') type='1'; if(type==='series'||type==='anime') type='0';
+  return cached('meta:'+contentId+':'+type, CACHE_TTL['v4/getItemData'], async()=>{
+    const response=await api('v4/getItemData',{contentId,type,sortType:'0',language:'en',macAddr:FIXED_MAC});
+    const data=(response && response.item && typeof response.item==='object')?response.item:response;
+    const item=normalizeItem(Object.assign({},seed||{},data,{contentId,id:contentId}));
+    item.details=data;
+    const rawSeasons=listFrom(data,['seasonList','seasons','seriesList']);
+    item.seasons=rawSeasons.map((season,i)=>{
+      const eps=listFrom(season,['episodeList','episodes','movieList','assetList']).map((ep,j)=>{
+        const e=normalizeItem(ep, item.type==='anime'?'anime':undefined);
+        return {number:Number(ep.episodeNo||ep.episodeNum||ep.episode||ep.number||j+1),id:String(ep.contentId||ep.id||ep.movieId||`${contentId}_e${j+1}`),title:String(ep.name||ep.title||ep.viewPoint||`Episodio ${j+1}`),overview:String(ep.description||ep.desc||''),still:ep.poster||ep.posterUrl||e.poster||item.backdrop||item.poster};
+      });
+      return {number:Number(season.seasonNo||season.seasonNum||season.seasonNumber||season.number||i+1),name:String(season.name||season.title||`Temporada ${i+1}`),episodes:eps};
+    });
+    const episodes=listFrom(data,['episodeList','episodes','movieList']);
+    item.episodes=episodes;
+    item.type=type==='0'?(seed&&seed.type==='anime'?'anime':'series'):'movie';
+    item.media_type=item.type;
+    return item;
+  });
 }
 async function getStreams(id, type, season, episode) {
   const contentId = String(id && typeof id === 'object' ? (id.contentId || id.id) : id || '').trim();
@@ -311,4 +440,4 @@ async function getStreams(id, type, season, episode) {
   const url = `${base}/vod/${media.contentId || contentId}_media.${ext}`;
   return [{name:'Magis Service',title:'Magis Service',url,quality:String(media.definition || media.resolution || 'Auto'),type:ext==='mp4'?'mp4':'ts',mimeType:ext==='mp4'?'video/mp4':'video/mp2t',headers:{'Content-Auth':String(chosen.u.url),'Content-License':license,'User-Agent':'Ranger/4.9.4-17294ac0','App':config().appId,'App-Version':config().apkVersion},language:'Español',isHls:false}];
 }
-module.exports = { getNews, getHome, getDiscoverFilters, getDiscover, search, getMeta, getStreams, getCatalogs };
+module.exports = { getNews, getHome, getDiscoverFilters, getDiscover, getCatalog, search, getMeta, getStreams, getCatalogs };

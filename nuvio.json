@@ -1,8 +1,8 @@
 {
   "id": "magis-service-catalog",
   "name": "Magis Service Catalog",
-  "version": "1.0.0",
-  "description": "Catálogo por tipo, categorías, búsqueda, detalles y novedades independientes.",
+  "version": "1.1.0",
+  "description": "Catálogo Magis optimizado con caché, límites de espera, categorías reales y novedades separadas.",
   "author": "Community",
   "entry": "index.js",
   "languages": [
