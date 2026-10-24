@@ -43,3 +43,14 @@ Los valores predeterminados corresponden a los valores que la app de referencia 
 - La inicialización de sesión anónima se comparte entre llamadas concurrentes.
 
 Si un host no responde, el repositorio devuelve un resultado vacío/error en lugar de seguir lanzando una cadena ilimitada de solicitudes. Los tiempos límite dependen también del puente HTTP de la app anfitriona.
+
+
+## Correcciones 1.2.0
+- Conserva categorías de navegación aunque no incluyan elementos hasta abrirlas.
+- Resuelve categorías que llegan identificadas por `columnCode` o `columnId`.
+- Recuerda el tipo de contenido de películas, series y animación para consultar la ficha con el tipo correcto.
+- Acepta envoltorios de respuesta `data`, `result` e `item` que algunas versiones del servicio utilizan.
+- Amplía los alias de título, descripción y géneros para evitar fichas que solo muestran el ID.
+- Acepta el tipo como segundo argumento de `getMeta` cuando el runtime lo pasa como texto.
+
+La validación local comprueba sintaxis y empaquetado. La respuesta real depende del proveedor y debe verificarse con una sesión activa.
