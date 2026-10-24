@@ -1,0 +1,67 @@
+{
+  "id": "magis-service-catalog",
+  "name": "Magis Service Catalog",
+  "version": "1.0.0",
+  "description": "Catálogo por tipo, categorías, búsqueda, detalles y novedades independientes.",
+  "author": "Community",
+  "entry": "index.js",
+  "languages": [
+    "Latino",
+    "Castellano",
+    "Español"
+  ],
+  "capabilities": [
+    "home",
+    "discover",
+    "search",
+    "meta",
+    "streams",
+    "news",
+    "catalogs"
+  ],
+  "config": [
+    {
+      "key": "hosts",
+      "label": "Hosts del servicio (separados por coma)",
+      "type": "text",
+      "default": "sqacjy.s5lm5aydc.xyz,osuhk.m3x8o50te.com",
+      "required": true
+    },
+    {
+      "key": "scheme",
+      "label": "Protocolo",
+      "type": "select",
+      "default": "https",
+      "options": [
+        "https",
+        "http"
+      ]
+    },
+    {
+      "key": "appId",
+      "label": "App ID",
+      "type": "text",
+      "default": "com.android.msandroid",
+      "required": true
+    },
+    {
+      "key": "apkVersion",
+      "label": "Versión de API",
+      "type": "text",
+      "default": "49902"
+    },
+    {
+      "key": "desKeyHex",
+      "label": "Clave 3DES (hexadecimal)",
+      "type": "password",
+      "default": "e7af1ed7de1ffddd7bd3fe37ebdffde9ef3fe1ae39edfeb8",
+      "required": true
+    },
+    {
+      "key": "newsLimit",
+      "label": "Máximo de novedades",
+      "type": "number",
+      "default": "12"
+    }
+  ]
+}
