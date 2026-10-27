@@ -688,10 +688,9 @@ async function _getDiscoverFilters(filters) {
   const seen = new Set();
   for (let i = 0; i < kinds.length; i++) {
     for (const row of rowsByKind[i]) {
-      // Preferir shelveId numérico para que la app pagine con getShelveData
-      const id = String(row.shelveId || row.id || row.code || '');
-      if (!id || seen.has(id)) continue;
-      if (!(row.items && row.items.length) && !row.id && !row.code && !row.shelveId) continue;
+      // XPPC: solo categorías con columnId numérico (getShelveData no acepta codes)
+      const id = String(row.shelveId || (/^\d+$/.test(String(row.id || '')) ? row.id : ''));
+      if (!id || !/^\d+$/.test(id) || seen.has(id)) continue;
       seen.add(id);
       categoryKinds.set(id, kinds[i]);
       limitMap(categoryKinds, MAX_MAP);
@@ -699,13 +698,10 @@ async function _getDiscoverFilters(filters) {
         categoryKinds.set(String(row.code), kinds[i]);
         limitMap(categoryKinds, MAX_MAP);
       }
-      if (row.id && String(row.id) !== id) {
-        categoryKinds.set(String(row.id), kinds[i]);
-      }
       options.push({
         id,
         label: row.title || row.name || kindLabel(kinds[i]),
-        columnId: String(row.shelveId || id),
+        columnId: id,
         columnCode: String(row.code || ''),
         type: kinds[i] === 'movies' ? 'movie' : kinds[i]
       });
@@ -732,22 +728,37 @@ async function _getDiscoverFilters(filters) {
   ];
 }
 
-/** Una página de estantería: solo lo que pide la app (page/pageSize), sin cargar todo de golpe */
+/**
+ * Lista completa paginada (XPPC):
+ *   v3/getShelveData { columnId, columnType:'2', pageNum, pageSize, encryptVersion:0 }
+ * El assetList del árbol (~10) es solo preview; aquí va la lista real.
+ */
 async function fetchShelvePage(columnId, forcedType, page, pageSize) {
-  const tryTypes = ['2', '1', '0'];
-  for (const columnType of tryTypes) {
+  const idNum = Number(columnId);
+  const idStr = String(columnId);
+  if (!Number.isFinite(idNum) || idNum <= 0) {
+    return { items: [], page, hasMore: false, total: 0 };
+  }
+
+  const beans = [
+    { columnId: idNum, columnType: '2', pageNum: page, pageSize, encryptVersion: 0 },
+    { columnId: idStr, columnType: '2', pageNum: page, pageSize, encryptVersion: 0 },
+    { columnId: idNum, columnType: 2, pageNum: page, pageSize, encryptVersion: 0 },
+    { columnId: idNum, columnType: '1', pageNum: page, pageSize, encryptVersion: 0 },
+    { columnId: idNum, columnType: '0', pageNum: page, pageSize, encryptVersion: 0 },
+    { columnId: idNum, columnType: '2', pageNum: page, pageSize }
+  ];
+
+  for (const bean of beans) {
     try {
-      const data = await api('v3/getShelveData', {
-        columnId: String(columnId),
-        columnType,
-        pageNum: page,
-        pageSize,
-        encryptVersion: 0
-      });
-      let items = flattenItems(data, forcedType);
-      if (!items.length) {
-        items = normalizeRows(data, 'Catálogo', forcedType).flatMap(r => r.items || []);
+      const data = await api('v3/getShelveData', bean);
+      let items = [];
+      if (Array.isArray(data.assetList)) {
+        items = data.assetList
+          .filter(x => x && typeof x === 'object')
+          .map(x => normalizeItem(x, forcedType));
       }
+      if (!items.length) items = flattenItems(data, forcedType);
       items = unique(items).map(it => {
         const t = forcedType || itemType(it);
         if (it.id) {
@@ -757,57 +768,45 @@ async function fetchShelvePage(columnId, forcedType, page, pageSize) {
         return Object.assign({}, it, { type: t, media_type: t });
       });
       const totalRaw = data.assetListTotalSize ?? data.listTotalSize ?? data.totalSize ?? data.total ?? data.count;
-      // El API ya pagina: no volver a cortar salvo que devuelva de más
       const pageItems = items.length > pageSize ? items.slice(0, pageSize) : items;
-      const total = Number(totalRaw != null ? totalRaw : (page - 1) * pageSize + pageItems.length + (pageItems.length >= pageSize ? pageSize : 0));
+      const total = totalRaw != null
+        ? Number(totalRaw)
+        : (page - 1) * pageSize + pageItems.length + (pageItems.length >= 10 ? pageSize : 0);
+      // Magis a menudo devuelve ~10 por página aunque pidas 20/40; sin total, asumir más si trajo un bloque lleno
       const hasMore = totalRaw != null
         ? page * pageSize < Number(totalRaw)
-        : pageItems.length >= pageSize;
-      if (pageItems.length || totalRaw != null) {
+        : pageItems.length >= 10;
+      if (pageItems.length || (totalRaw != null && Number(totalRaw) > 0)) {
         return { items: pageItems, page, hasMore, total: Number(total) || pageItems.length };
       }
     } catch (_) {}
   }
-  // Algunas categorías son nodos de navegación: bajar un nivel y tomar assets de la primera hoja
+
   try {
     const data = await api('getNextColumns', {
-      columnCode: String(columnId),
+      columnCode: idStr,
       pageNum: 1,
-      pageSize: 20,
+      pageSize: 60,
       version: ''
     });
     const rows = normalizeRows(data, 'Catálogo', forcedType);
     for (const row of rows) {
-      const cid = String(row.id || '');
-      if (!/^\d+$/.test(cid)) continue;
+      const cid = row.shelveId || (/^\d+$/.test(String(row.id || '')) ? String(row.id) : '');
+      if (!cid || cid === idStr) continue;
       const nested = await fetchShelvePage(cid, forcedType, page, pageSize);
-      if (nested.items.length) return nested;
-    }
-    // Si las filas ya traen items
-    const flat = unique(rows.flatMap(r => r.items || [])).map(it => {
-      const t = forcedType || itemType(it);
-      return Object.assign({}, it, { type: t, media_type: t });
-    });
-    if (flat.length) {
-      const start = (page - 1) * pageSize;
-      const pageItems = flat.slice(start, start + pageSize);
-      return {
-        items: pageItems,
-        page,
-        hasMore: start + pageSize < flat.length,
-        total: flat.length
-      };
+      if (nested.items.length || nested.hasMore) return nested;
     }
   } catch (_) {}
+
   return { items: [], page, hasMore: false, total: 0 };
 }
 
 async function _getDiscover(options) {
   const opts = options && typeof options === 'object' ? options : {};
-  // UI: { page, type, category } — paginación real en servidor (getShelveData pageNum)
+  // Paginación servidor: v3/getShelveData (igual que XPPC page())
   const kind = resolveKind(opts.type || opts.kind || 'movie');
   const page = Math.max(1, parseInt(opts.page, 10) || 1);
-  const pageSize = Math.min(30, Math.max(8, parseInt(opts.pageSize, 10) || 20));
+  const pageSize = Math.min(40, Math.max(10, parseInt(opts.pageSize, 10) || 20));
   const rootKey = kind === 'anime' ? 'anime' : kind === 'series' ? 'series' : 'movies';
   const forcedType = rootKey === 'series' ? 'series' : rootKey === 'anime' ? 'anime' : 'movie';
 
@@ -835,98 +834,45 @@ async function _getDiscover(options) {
     selected = '';
   }
 
-  let rows = await categoryRows(rootKey).catch(() => []);
-  if (!selected) {
-    const first = rows.find(r => r.id || r.code);
-    if (first) selected = String(first.id || first.code);
-  }
+  const rows = await categoryRows(rootKey).catch(() => []);
 
-  let found = null;
-  if (selected) {
-    found = rows.find(r =>
+  // Resolver a columnId numérico (único que pagina el portal)
+  let shelveId = '';
+  if (selected && /^\d+$/.test(selected)) {
+    shelveId = selected;
+  } else if (selected) {
+    const found = rows.find(r =>
       String(r.id) === selected ||
       String(r.code) === selected ||
+      String(r.shelveId || '') === selected ||
       r.title === selected ||
       r.name === selected
-    ) || null;
-    if (found) selected = String(found.id || found.code);
-  }
-
-  const cached = categoryItemsCache.get(selected) || (found ? {
-    items: found.items || [],
-    shelveId: found.shelveId || (/^\d+$/.test(String(found.id || '')) ? String(found.id) : ''),
-    code: found.code || '',
-    kind: rootKey,
-    title: found.title
-  } : null);
-
-  // shelveId numérico → lista completa paginada en el portal (no el preview de 10 del árbol)
-  const shelveId = (cached && cached.shelveId) ||
-    (found && found.shelveId) ||
-    (/^\d+$/.test(selected) ? selected : '');
-
-  if (shelveId && /^\d+$/.test(shelveId)) {
-    const pageResult = await fetchShelvePage(shelveId, forcedType, page, pageSize);
-    if (pageResult.items.length || pageResult.hasMore || pageResult.total) {
-      return pageResult;
+    );
+    if (found) {
+      shelveId = String(found.shelveId || (/^\d+$/.test(String(found.id || '')) ? found.id : ''));
     }
+    const cached = categoryItemsCache.get(selected);
+    if (!shelveId && cached && cached.shelveId) shelveId = String(cached.shelveId);
   }
 
-  // Si hay columnCode de sección, pedir más páginas del árbol de esa columna
-  const sectionCode = (cached && cached.code) || (found && found.code) || '';
-  if (sectionCode) {
-    try {
-      const data = await api('getNextColumns', {
-        columnCode: sectionCode,
-        pageNum: page,
-        pageSize,
-        version: ''
-      });
-      let items = [];
-      if (Array.isArray(data.assetList)) {
-        items = data.assetList.filter(x => x && typeof x === 'object').map(x => normalizeItem(x, forcedType));
-      }
-      if (!items.length) {
-        const sub = normalizeRows(data, sectionCode, forcedType);
-        items = unique(sub.flatMap(r => r.items || []));
-      }
-      items = unique(items).map(it => {
-        const t = forcedType || itemType(it);
-        if (it.id) {
-          itemKinds.set(it.id, t);
-          limitMap(itemKinds, MAX_MAP);
-        }
-        return Object.assign({}, it, { type: t, media_type: t });
-      });
-      if (items.length) {
-        return {
-          items: items.length > pageSize ? items.slice(0, pageSize) : items,
-          page,
-          hasMore: items.length >= pageSize,
-          total: (page - 1) * pageSize + items.length + (items.length >= pageSize ? pageSize : 0)
-        };
-      }
-    } catch (_) {}
+  if (!shelveId) {
+    const first = rows.find(r => r.shelveId || /^\d+$/.test(String(r.id || '')));
+    if (first) shelveId = String(first.shelveId || first.id);
+  }
+  // Último recurso: raíz del tipo (76263 / 76235 / 76209)
+  if (!shelveId || !/^\d+$/.test(shelveId)) {
+    shelveId = String(ROOT[rootKey] || ROOT.movies);
   }
 
-  // Preview del assetList del árbol (últimos ~10): solo si no hubo shelve/código
-  if (cached && cached.items && cached.items.length) {
-    const all = cached.items.map(it => {
-      const t = forcedType || itemType(it);
-      if (it.id) {
-        itemKinds.set(it.id, t);
-        limitMap(itemKinds, MAX_MAP);
-      }
-      return Object.assign({}, it, { type: t, media_type: t });
-    });
-    const start = (page - 1) * pageSize;
-    const pageItems = all.slice(start, start + pageSize);
-    return {
-      items: pageItems,
-      page,
-      hasMore: start + pageSize < all.length,
-      total: all.length
-    };
+  // Siempre portal paginado — nunca quedarse en el preview de 10 del árbol
+  const pageResult = await fetchShelvePage(shelveId, forcedType, page, pageSize);
+  if (pageResult.items.length || pageResult.hasMore) return pageResult;
+
+  // Si la categoría falló, intentar raíz del tipo (sigue siendo paginado)
+  const rootId = String(ROOT[rootKey] || ROOT.movies);
+  if (shelveId !== rootId) {
+    const rootPage = await fetchShelvePage(rootId, forcedType, page, pageSize);
+    if (rootPage.items.length || rootPage.hasMore) return rootPage;
   }
 
   return { items: [], page, hasMore: false, total: 0 };
