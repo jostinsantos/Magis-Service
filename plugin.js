@@ -359,17 +359,27 @@ function flattenItems(data, forcedType) {
 
 function normalizeItem(raw, forcedType) {
   const images = Array.isArray(raw.posterList || raw.posters || raw.imageList) ? (raw.posterList || raw.posters || raw.imageList) : [];
-  let poster = raw.poster || raw.posterUrl || raw.pic || raw.cover || raw.image || '';
-  let backdrop = raw.backdrop || raw.backdropUrl || raw.background || '';
+  let poster = String(raw.poster || raw.posterUrl || raw.pic || raw.cover || raw.image || '').trim();
+  let backdrop = String(raw.backdrop || raw.backdropUrl || raw.background || '').trim();
+  // Magis: v_poster/cover = vertical; poster/h_poster = horizontal (slider/hero)
   for (const img of images) {
     if (!img || typeof img !== 'object') continue;
     const kind = String(img.fileType || img.type || '').toLowerCase();
-    const url = String(img.fileUrl || img.url || img.picUrl || '');
+    const url = String(img.fileUrl || img.url || img.picUrl || '').trim();
     if (!url) continue;
-    if (!poster && ['icon', 'h_poster', 'v_poster', 'cover', 'thumb'].includes(kind)) poster = url;
-    if (!backdrop && kind === 'poster') backdrop = url;
-    if (!poster) poster = url;
+    if (['v_poster', 'icon', 'cover', 'thumb', 'vertical'].includes(kind)) {
+      if (!poster) poster = url;
+    } else if (['poster', 'h_poster', 'backdrop', 'background', 'banner', 'horizontal'].includes(kind)) {
+      if (!backdrop) backdrop = url;
+    } else if (!poster) {
+      poster = url;
+    } else if (!backdrop) {
+      backdrop = url;
+    }
   }
+  // El slider del Home usa backdrop ?? poster; string vacío NO hace fallback en Dart
+  if (!backdrop && poster) backdrop = poster;
+  if (!poster && backdrop) poster = backdrop;
   const programType = String(raw.programType || raw.contentType || raw.type || raw.mediaType || 'movie').toLowerCase();
   const explicitMovie = ['movie', 'film', '1', 'cinema', 'feature'].includes(programType);
   let type = forcedType || (!explicitMovie && ['teleplay', 'series', 'variety', '0'].includes(programType) ? 'series' : 'movie');
@@ -588,7 +598,19 @@ async function _getNews() {
   // News más corto en Home (el resto se ve en Descubrir / búsqueda)
   const limit = Math.max(1, Math.min(8, parseInt(config().newsLimit, 10) || 8));
   const items = await featured();
-  return unique(items).slice(0, limit).map((it, i) => Object.assign({}, it, { section: 'novedades', news: true, newsRank: i + 1 }));
+  return unique(items).slice(0, limit).map((it, i) => {
+    const poster = String(it.poster || it.image || it.backdrop || '').trim();
+    const backdrop = String(it.backdrop || it.background || it.poster || it.image || '').trim();
+    return Object.assign({}, it, {
+      section: 'novedades',
+      news: true,
+      newsRank: i + 1,
+      poster,
+      image: poster || backdrop,
+      backdrop: backdrop || poster,
+      background: backdrop || poster
+    });
+  });
 }
 
 async function _getHome() {
