@@ -2,23 +2,41 @@
   "id": "magis-service-catalog",
   "name": "XuperTv",
   "version": "0.1.1",
-  "description": "Port de MagisCatalog optimizado: caché, llamadas agrupadas, paginación y reproducción de episodios.",
+  "entry": "plugin.js",
+  "icon": "icon.png",
   "author": "JostinSantos",
-  "entry": "index.js",
-  "languages": [
-    "Latino",
-    "Castellano",
-    "Español"
+  "description": "Películas, series, anime y doramas en español latino de sololatino.net: géneros, plataformas, búsqueda y varios servidores por título.",
+  "color": "#06B6D4",
+  "theme": {
+    "accent": "#06B6D4",
+    "onAccent": "#001418",
+    "background": "#070E18",
+    "surface": "#0F1B2B",
+    "highlight": "#67E8F9"
+  },
+  "section": {
+    "label": "XuperTv"
+  },
+  "categories": [
+    "movies",
+    "series"
   ],
   "capabilities": [
     "home",
     "discover",
     "search",
     "meta",
-    "streams",
-    "news",
-    "catalogs"
+    "streams"
   ],
+  "languages": [
+    "Latino",
+    "Castellano",
+    "Subtitulado"
+  ],
+  "episodesPagination": {
+    "enabled": true,
+    "perPage": 50
+  },
   "config": [
     
     {
