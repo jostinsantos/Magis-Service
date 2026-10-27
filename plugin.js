@@ -55,6 +55,10 @@ const seasonContentIds = new Map();
 const episodeSeasonId = new Map();
 // categoryId -> { items, kind, title }  (estilo Kino: assetList de getNextColumns)
 const categoryItemsCache = new Map();
+// series/movie contentId -> imdb tt...
+const contentImdbIds = new Map();
+// introdb cache key -> { intro:[s,e], outro:[s,e] }
+const introdbCache = new Map();
 
 const CACHE_TTL = {
   getHome: 8 * 60e3,
@@ -1147,6 +1151,73 @@ async function resolveTmdbId(item, isTv) {
   return hit && hit.id ? Number(hit.id) || 0 : 0;
 }
 
+/** IntroDB: segmentos intro/outro en segundos [start, end] para el player. */
+function introdbCacheKey(imdbId, season, episode, isMovie) {
+  const id = String(imdbId || '').toLowerCase();
+  if (isMovie) return id + ':movie';
+  return id + ':s' + Number(season || 1) + 'e' + Number(episode || 1);
+}
+
+function rangeFromSegment(seg) {
+  if (!seg || typeof seg !== 'object') return null;
+  const a = Number(seg.start_sec);
+  const b = Number(seg.end_sec);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) return null;
+  return [Math.floor(a), Math.ceil(b)];
+}
+
+async function fetchIntroDbSegments(imdbId, season, episode, isMovie) {
+  const id = String(imdbId || '').trim();
+  if (!/^tt\d{7,}$/i.test(id)) return null;
+  const ck = introdbCacheKey(id, season, episode, isMovie);
+  const hit = introdbCache.get(ck);
+  if (hit !== undefined) return hit; // puede ser null (sin datos)
+
+  let url = 'https://api.introdb.app/segments?imdb_id=' + encodeURIComponent(id);
+  if (!isMovie) {
+    url += '&season=' + encodeURIComponent(String(Number(season || 1) || 1));
+    url += '&episode=' + encodeURIComponent(String(Number(episode || 1) || 1));
+  }
+  try {
+    const opts = { method: 'GET', headers: { Accept: 'application/json' } };
+    if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+      opts.signal = AbortSignal.timeout(5000);
+    }
+    const res = await fetch(url, opts);
+    if (!res.ok) {
+      introdbCache.set(ck, null);
+      limitMap(introdbCache, 300);
+      return null;
+    }
+    const json = await res.json();
+    const intro = rangeFromSegment(json && json.intro);
+    const outro = rangeFromSegment(json && json.outro);
+    const segments = {};
+    if (intro) segments.intro = intro;
+    if (outro) segments.outro = outro;
+    const out = (segments.intro || segments.outro) ? segments : null;
+    introdbCache.set(ck, out);
+    limitMap(introdbCache, 300);
+    return out;
+  } catch (_) {
+    introdbCache.set(ck, null);
+    limitMap(introdbCache, 300);
+    return null;
+  }
+}
+
+async function resolveImdbFromTmdb(tmdbId, isTv) {
+  if (!tmdbId) return '';
+  try {
+    const path = isTv ? ('/tv/' + tmdbId + '/external_ids') : ('/movie/' + tmdbId + '/external_ids');
+    const ext = await tmdbGet(path, {});
+    const imdb = ext && String(ext.imdb_id || '').trim();
+    return /^tt\d{7,}$/i.test(imdb) ? imdb : '';
+  } catch (_) {
+    return '';
+  }
+}
+
 /**
  * Enriquece ficha Magis con TMDB:
  *  - logo (player / UI)
@@ -1162,11 +1233,23 @@ async function enrichEpisodeStillsFromTmdb(item) {
       const tvId = await resolveTmdbId(item, true);
       if (!tvId) return item;
 
-      // Detalle + imágenes en paralelo (logo + overview/backdrop si faltan)
-      const [detail, images] = await Promise.all([
+      // IMDb (IntroDB) + detalle + logo
+      const [detail, images, imdbFromTmdb] = await Promise.all([
         tmdbGet('/tv/' + tvId, {}),
-        tmdbGet('/tv/' + tvId + '/images', { include_image_language: 'es,en,null' })
+        tmdbGet('/tv/' + tvId + '/images', { include_image_language: 'es,en,null' }),
+        resolveImdbFromTmdb(tvId, true)
       ]);
+      let imdbId = imdbFromTmdb || String(
+        (item.details && (item.details.keyWords || item.details.imdbId || item.details.imdb)) ||
+        item.imdb || item.imdbId || ''
+      ).trim();
+      if (!/^tt\d{7,}$/i.test(imdbId)) imdbId = '';
+      if (imdbId) {
+        item.imdbId = imdbId;
+        item.imdb = imdbId;
+        contentImdbIds.set(String(item.id || item.contentId || ''), imdbId);
+        limitMap(contentImdbIds, MAX_MAP);
+      }
       const logo = pickLogo(images);
       if (logo) {
         item.logo = logo;
@@ -1234,6 +1317,19 @@ async function enrichEpisodeStillsFromTmdb(item) {
             ep.air_date = ep.airDate;
           }
         }
+        // Intro/outro IntroDB por capítulo Magis (misma S/E)
+        if (imdbId) {
+          await Promise.all((s.episodes || []).map(async (ep) => {
+            const n = Number(ep.number || ep.episode || 0);
+            if (!n) return;
+            const seg = await fetchIntroDbSegments(imdbId, sn, n, false);
+            if (seg) {
+              ep.segments = seg;
+              ep.skip = seg;
+              ep.markers = seg;
+            }
+          }));
+        }
       }));
 
       if (Array.isArray(item.episodes) && item.seasons.length) {
@@ -1242,13 +1338,25 @@ async function enrichEpisodeStillsFromTmdb(item) {
         if (cur && cur.episodes && cur.episodes.length) item.episodes = cur.episodes;
       }
     } else {
-      // Película: logo + overview/poster si faltan
+      // Película: logo + overview/poster + intro/outro
       const movieId = await resolveTmdbId(item, false);
       if (!movieId) return item;
-      const [detail, images] = await Promise.all([
+      const [detail, images, imdbFromTmdb] = await Promise.all([
         tmdbGet('/movie/' + movieId, {}),
-        tmdbGet('/movie/' + movieId + '/images', { include_image_language: 'es,en,null' })
+        tmdbGet('/movie/' + movieId + '/images', { include_image_language: 'es,en,null' }),
+        resolveImdbFromTmdb(movieId, false)
       ]);
+      let imdbId = imdbFromTmdb || String(
+        (item.details && (item.details.keyWords || item.details.imdbId || item.details.imdb)) ||
+        item.imdb || item.imdbId || ''
+      ).trim();
+      if (!/^tt\d{7,}$/i.test(imdbId)) imdbId = '';
+      if (imdbId) {
+        item.imdbId = imdbId;
+        item.imdb = imdbId;
+        contentImdbIds.set(String(item.id || item.contentId || ''), imdbId);
+        limitMap(contentImdbIds, MAX_MAP);
+      }
       const logo = pickLogo(images);
       if (logo) {
         item.logo = logo;
@@ -1270,6 +1378,14 @@ async function enrichEpisodeStillsFromTmdb(item) {
         }
         if (detail.runtime > 0) {
           item.runtime = Number(detail.runtime);
+        }
+      }
+      if (imdbId) {
+        const seg = await fetchIntroDbSegments(imdbId, 0, 0, true);
+        if (seg) {
+          item.segments = seg;
+          item.skip = seg;
+          item.markers = seg;
         }
       }
     }
@@ -1843,7 +1959,29 @@ async function _getStreams(id, type, season, episode) {
     ...(episodeList || [])
   );
 
-  return [{
+  // Intro/outro para el botón Omitir del player (StreamSegments: intro/outro [start,end] en segundos)
+  let streamSegments = null;
+  try {
+    const rootForImdb = String(
+      (id && typeof id === 'object' && (id.seriesContentId || id.contentId || id.id)) ||
+      episodeParent.get(playableId) ||
+      parentId
+    );
+    let imdbId = contentImdbIds.get(rootForImdb) || contentImdbIds.get(parentId) || contentImdbIds.get(playableId) || '';
+    if (!imdbId) {
+      // Meta puede no haberse abierto: intentar resolver rápido por título no; sin imdb no hay IntroDB
+      imdbId = '';
+    }
+    if (imdbId) {
+      if (isSeries) {
+        streamSegments = await fetchIntroDbSegments(imdbId, season, episode, false);
+      } else {
+        streamSegments = await fetchIntroDbSegments(imdbId, 0, 0, true);
+      }
+    }
+  } catch (_) {}
+
+  const stream = {
     name: 'Magis Service',
     title: 'Magis Service',
     url,
@@ -1862,7 +2000,13 @@ async function _getStreams(id, type, season, episode) {
     subtitles,
     subs: subtitles,
     captions: subtitles
-  }];
+  };
+  if (streamSegments) {
+    stream.segments = streamSegments;
+    stream.skip = streamSegments;
+    stream.markers = streamSegments;
+  }
+  return [stream];
 }
 
 // ─── API pública ───────────────────────────────────────────────────────────
