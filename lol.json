@@ -1,9 +1,9 @@
 {
   "id": "magis-service-catalog",
   "name": "Magis Service Catalog",
-  "version": "1.5.0",
+  "version": "0.1.1",
   "description": "Port de MagisCatalog optimizado: caché, llamadas agrupadas, paginación y reproducción de episodios.",
-  "author": "Community",
+  "author": "JostinSantos",
   "entry": "index.js",
   "languages": [
     "Latino",
