@@ -44,6 +44,8 @@ const episodeParent = new Map();
 const seasonContentIds = new Map();
 // episode contentId -> contentId de su temporada (startPlayVOD.seriesContentId)
 const episodeSeasonId = new Map();
+// categoryId -> { items, kind, title }  (estilo Kino: assetList de getNextColumns)
+const categoryItemsCache = new Map();
 
 const CACHE_TTL = {
   getHome: 4 * 60e3,
@@ -403,26 +405,38 @@ function rowName(row, fallback) {
 
 function normalizeRows(data, fallback, forcedType) {
   if (data && data.data && typeof data.data === 'object' && !Array.isArray(data.data)) data = data.data;
-  let rows = listFrom(data, ['columnList', 'homeColumnList', 'rowList', 'list', 'columns', 'childColumnList', 'nextColumnList', 'columnInfoList']);
-  if (!rows.length && data && typeof data === 'object' && Array.isArray(data.recommendList)) rows = data.recommendList;
+  // Kino/Xuper: getNextColumns devuelve recommendList[{ name, assetList, columnId?, recommendCode? }]
+  let rows = [];
+  if (data && typeof data === 'object' && Array.isArray(data.recommendList)) rows = data.recommendList;
+  if (!rows.length) {
+    rows = listFrom(data, ['columnList', 'homeColumnList', 'rowList', 'list', 'columns', 'childColumnList', 'nextColumnList', 'columnInfoList']);
+  }
   if (!rows.length && data && typeof data === 'object' && Array.isArray(data.assetList)) {
     const items = flattenItems(data, forcedType);
-    return items.length ? [{ id: String(data.columnId || ''), code: String(data.columnCode || ''), title: rowName(data, fallback), name: rowName(data, fallback), items }] : [];
+    return items.length ? [{ id: String(data.columnId || data.recommendCode || 'root'), code: String(data.columnCode || data.recommendCode || ''), title: rowName(data, fallback), name: rowName(data, fallback), items }] : [];
   }
   if (!rows.length) {
     const items = flattenItems(data, forcedType);
-    return items.length ? [{ id: String(data.columnId || ''), code: String(data.columnCode || ''), title: fallback, name: fallback, items }] : [];
+    return items.length ? [{ id: String(data.columnId || 'root'), code: String(data.columnCode || ''), title: fallback, name: fallback, items }] : [];
   }
   const out = [];
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
     if (!r || typeof r !== 'object') continue;
     const title = rowName(r, `${fallback} ${i + 1}`);
-    const items = flattenItems(r, forcedType);
-    const id = String(r.columnId || r.id || '');
-    const code = String(r.columnCode || r.recommendCode || '');
+    // Preferir assetList directo (como parseTree de Kino)
+    let items = [];
+    if (Array.isArray(r.assetList) && r.assetList.length) {
+      items = r.assetList.filter(x => x && typeof x === 'object').map(x => normalizeItem(x, forcedType));
+    } else {
+      items = flattenItems(r, forcedType);
+    }
+    const code = String(r.columnCode || r.recommendCode || r.code || '');
+    // id estable: columnId numérico, si no recommendCode/code, si no índice
+    let id = String(r.columnId || r.id || '');
+    if (!id || id === 'undefined') id = code || `cat_${i}`;
     if (!items.length && !id && !code) continue;
-    out.push({ id, code, title, name: title, items });
+    out.push({ id, code, title, name: title, items: unique(items) });
   }
   return out;
 }
@@ -617,18 +631,44 @@ async function getCatalog(catalogId, options) {
 async function categoryRows(kind) {
   const code = HOME[kind] || HOME.movies;
   const forcedType = kind === 'series' ? 'series' : kind === 'anime' ? 'anime' : 'movie';
+  // Igual que Kino: getNextColumns sobre masnew_movies / series / anime → recommendList + assetList
   try {
     const data = await api('getNextColumns', { columnCode: code, pageNum: 1, pageSize: 50, version: '' });
     const rows = normalizeRows(data, kindLabel(kind), forcedType);
-    const usable = rows.filter(r => r.id || r.code);
+    const usable = rows.filter(r => (r.items && r.items.length) || r.id || r.code);
     if (usable.length) {
       categoryKindsFromRows(usable, kind);
+      for (const row of usable) {
+        const key = String(row.id || row.code);
+        if (!key) continue;
+        categoryItemsCache.set(key, {
+          items: unique(row.items || []),
+          kind,
+          title: row.title || row.name || key,
+          code: row.code || ''
+        });
+        if (row.code && row.code !== key) {
+          categoryItemsCache.set(String(row.code), categoryItemsCache.get(key));
+        }
+        limitMap(categoryItemsCache, MAX_MAP);
+      }
       return usable;
     }
   } catch (_) {}
   const rows = await homeRows(kind).catch(() => []);
   categoryKindsFromRows(rows, kind);
-  return rows.filter(r => r.id || r.code);
+  for (const row of rows) {
+    const key = String(row.id || row.code);
+    if (!key) continue;
+    categoryItemsCache.set(key, {
+      items: unique(row.items || []),
+      kind,
+      title: row.title || row.name || key,
+      code: row.code || ''
+    });
+    limitMap(categoryItemsCache, MAX_MAP);
+  }
+  return rows.filter(r => r.id || r.code || (r.items && r.items.length));
 }
 
 /**
@@ -653,9 +693,11 @@ async function _getDiscoverFilters(filters) {
   const seen = new Set();
   for (let i = 0; i < kinds.length; i++) {
     for (const row of rowsByKind[i]) {
-      const id = String(row.id || '');
-      // Solo columnId numérico real (nada de "all")
-      if (!/^\d+$/.test(id) || seen.has(id)) continue;
+      // Kino no exige columnId numérico: usa la sección del recommendList
+      const id = String(row.id || row.code || '');
+      if (!id || seen.has(id)) continue;
+      // Solo categorías que ya traen contenido (assetList) o id válido
+      if (!(row.items && row.items.length) && !row.id && !row.code) continue;
       seen.add(id);
       categoryKinds.set(id, kinds[i]);
       limitMap(categoryKinds, MAX_MAP);
@@ -672,10 +714,9 @@ async function _getDiscoverFilters(filters) {
       });
     }
   }
-  // Si no hubo columnas, al menos la raíz del tipo como única categoría
   if (!options.length) {
     for (const k of kinds) {
-      const rootId = ROOT[k] || ROOT.movies;
+      const rootId = String(ROOT[k] || ROOT.movies);
       if (seen.has(rootId)) continue;
       seen.add(rootId);
       categoryKinds.set(rootId, k);
@@ -766,10 +807,12 @@ async function fetchShelvePage(columnId, forcedType, page, pageSize) {
 
 async function _getDiscover(options) {
   const opts = options && typeof options === 'object' ? options : {};
-  // UI: { page, type, category } — category debe ser un columnId de UNA categoría
+  // UI: { page, type, category } — category = id de sección (como Kino browse sobre recommendList)
   const kind = resolveKind(opts.type || opts.kind || 'movie');
   const page = Math.max(1, parseInt(opts.page, 10) || 1);
   const pageSize = Math.min(30, Math.max(8, parseInt(opts.pageSize, 10) || 20));
+  const rootKey = kind === 'anime' ? 'anime' : kind === 'series' ? 'series' : 'movies';
+  const forcedType = rootKey === 'series' ? 'series' : rootKey === 'anime' ? 'anime' : 'movie';
 
   let selected = String(
     opts.columnId ||
@@ -780,7 +823,6 @@ async function _getDiscover(options) {
     ''
   ).trim();
 
-  // Ignorar valores que no son categoría real
   if (
     !selected ||
     selected === 'all' ||
@@ -796,56 +838,72 @@ async function _getDiscover(options) {
     selected = '';
   }
 
-  // Resolver código/nombre → columnId numérico
-  if (selected && !/^\d+$/.test(selected)) {
-    const mapped = categoryKinds.get(selected);
-    const searchKinds = mapped
-      ? [mapped]
-      : [kind === 'movies' ? 'movies' : kind === 'all' ? 'movies' : kind];
-    for (const k of searchKinds) {
-      const rows = await categoryRows(k).catch(() => []);
-      const found = rows.find(r =>
-        String(r.id) === selected ||
-        String(r.code) === selected ||
-        r.title === selected ||
-        r.name === selected
-      );
-      if (found && /^\d+$/.test(String(found.id || ''))) {
-        selected = String(found.id);
-        categoryKinds.set(selected, k);
-        limitMap(categoryKinds, MAX_MAP);
-        break;
-      }
-    }
-    if (selected && !/^\d+$/.test(selected)) selected = '';
-  }
-
-  const forcedFromKind = kind === 'anime' ? 'anime' : kind === 'series' ? 'series' : 'movie';
-
-  // Si no hay categoría elegida (primer load), usar la primera categoría real del tipo
+  // Asegurar árbol de categorías cargado (getNextColumns + assetList, estilo Kino)
+  let rows = await categoryRows(rootKey).catch(() => []);
   if (!selected) {
-    try {
-      const rows = await categoryRows(kind === 'movies' ? 'movies' : kind === 'all' ? 'movies' : kind).catch(() => []);
-      const first = rows.find(r => /^\d+$/.test(String(r.id || '')));
-      if (first) selected = String(first.id);
-    } catch (_) {}
-    if (!selected) {
-      const rootKey = kind === 'anime' ? 'anime' : kind === 'series' ? 'series' : 'movies';
-      selected = ROOT[rootKey] || ROOT.movies;
+    const first = rows.find(r => r.id || r.code);
+    if (first) selected = String(first.id || first.code);
+  }
+
+  // Resolver por id, code o título
+  if (selected) {
+    const found = rows.find(r =>
+      String(r.id) === selected ||
+      String(r.code) === selected ||
+      r.title === selected ||
+      r.name === selected
+    );
+    if (found) selected = String(found.id || found.code);
+  }
+
+  // 1) Caché de assetList de esa categoría (principal, como Kino)
+  let cached = categoryItemsCache.get(selected);
+  if ((!cached || !cached.items.length) && selected) {
+    // Reintentar carga del árbol por si el filtro cambió de tipo
+    rows = await categoryRows(rootKey).catch(() => []);
+    const found = rows.find(r => String(r.id) === selected || String(r.code) === selected);
+    if (found && found.items && found.items.length) {
+      cached = { items: unique(found.items), kind: rootKey, title: found.title };
+      categoryItemsCache.set(selected, cached);
     }
   }
 
-  // SOLO contenido de esa categoría (nunca mezclar con otras ni con "todo")
+  if (cached && cached.items && cached.items.length) {
+    const all = cached.items.map(it => {
+      const t = forcedType || itemType(it);
+      if (it.id) {
+        itemKinds.set(it.id, t);
+        limitMap(itemKinds, MAX_MAP);
+      }
+      return Object.assign({}, it, { type: t, media_type: t });
+    });
+    const start = (page - 1) * pageSize;
+    const pageItems = all.slice(start, start + pageSize);
+    return {
+      items: pageItems,
+      page,
+      hasMore: start + pageSize < all.length,
+      total: all.length
+    };
+  }
+
+  // 2) Fallback: getShelveData solo si hay columnId numérico (algunas secciones sí lo soportan)
   if (selected && /^\d+$/.test(selected)) {
-    const mapped = categoryKinds.get(selected);
-    const inferred = mapped || (kind === 'all' ? '' : kind);
-    const forcedType = inferred === 'anime' ? 'anime'
-      : inferred === 'series' ? 'series'
-      : inferred === 'movies' || inferred === 'movie' ? 'movie'
-      : forcedFromKind;
     const pageResult = await fetchShelvePage(selected, forcedType, page, pageSize);
-    // Devolver tal cual: solo esa estantería, aunque venga vacía
-    return pageResult;
+    if (pageResult.items.length) return pageResult;
+  }
+
+  // 3) Último recurso: primera categoría del tipo con items
+  const withItems = rows.find(r => r.items && r.items.length);
+  if (withItems) {
+    const all = unique(withItems.items).map(it => Object.assign({}, it, { type: forcedType, media_type: forcedType }));
+    const start = (page - 1) * pageSize;
+    return {
+      items: all.slice(start, start + pageSize),
+      page,
+      hasMore: start + pageSize < all.length,
+      total: all.length
+    };
   }
 
   return { items: [], page, hasMore: false, total: 0 };
@@ -1241,7 +1299,11 @@ function normalizeSubLang(raw) {
   return { code: s.slice(0, 2), label: String(raw) };
 }
 
-/** Extrae subtítulos; baseUrl opcional para armar URLs absolutas (el player no manda headers en subs) */
+/**
+ * Subtítulos estilo Kino/Xuper:
+ *   play.episodeList[0].subtitleList[].file[0].url + language + fileType
+ * Más cualquier otra lista conocida. Devuelve TODOS los disponibles con URL.
+ */
 function extractSubtitles(baseUrl, ...sources) {
   const out = [];
   const seen = new Set();
@@ -1260,7 +1322,6 @@ function extractSubtitles(baseUrl, ...sources) {
   const push = (url, lang, label, format) => {
     const u = absolutize(url);
     if (!u || seen.has(u)) return;
-    // El player descarga el subtítulo por HTTP sin auth: solo URLs http(s)
     if (!/^https?:\/\//i.test(u)) return;
     seen.add(u);
     let fmt = String(format || '').toLowerCase().replace(/^\./, '');
@@ -1282,8 +1343,31 @@ function extractSubtitles(baseUrl, ...sources) {
     });
   };
 
+  // Camino principal Kino: subtitleList[].file[0].url
+  const readKinoSubs = (node) => {
+    if (!node || typeof node !== 'object') return;
+    const episodes = Array.isArray(node.episodeList) ? node.episodeList : [node];
+    for (const ep of episodes) {
+      if (!ep || typeof ep !== 'object') continue;
+      const list = ep.subtitleList || ep.subtitles || node.subtitleList;
+      if (!Array.isArray(list)) continue;
+      for (const sub of list) {
+        if (!sub || typeof sub !== 'object') continue;
+        const files = Array.isArray(sub.file) ? sub.file : (sub.file ? [sub.file] : []);
+        const file = files[0] || sub;
+        const url = (file && (file.url || file.fileUrl || file.src)) || sub.url || sub.fileUrl || '';
+        if (!url) continue;
+        const lang = sub.language || sub.lang || sub.languageCode || file.language || '';
+        const format = (file && (file.fileType || file.format || file.type)) || sub.format || 'srt';
+        push(url, lang, lang || 'Subtítulo', format);
+      }
+    }
+  };
+
   for (const src of sources) {
     if (!src || typeof src !== 'object') continue;
+    readKinoSubs(src);
+
     const lists = [
       src.subtitleList, src.subtitles, src.subs, src.captionList, src.captions,
       src.lanList, src.languageList, src.subtitleInfoList, src.subTitleList,
@@ -1298,14 +1382,22 @@ function extractSubtitles(baseUrl, ...sources) {
           continue;
         }
         if (typeof s !== 'object') continue;
-        const url = s.url || s.fileUrl || s.file || s.src || s.subtitleUrl || s.subUrl ||
+        // file[] anidado (formato portal)
+        if (Array.isArray(s.file) && s.file[0]) {
+          const f = s.file[0];
+          const url = f.url || f.fileUrl || f.src || '';
+          if (url) {
+            push(url, s.language || s.lang || f.language, s.language || s.name || 'Subtítulo', f.fileType || f.format || 'srt');
+            continue;
+          }
+        }
+        const url = s.url || s.fileUrl || s.src || s.subtitleUrl || s.subUrl ||
           s.path || s.address || s.downloadUrl || s.playUrl || s.uri || '';
-        const lang = s.lang || s.language || s.languageCode || s.code || s.lan || s.iso ||
-          s.languageName || s.langName || '';
+        const lang = s.lang || s.language || s.languageCode || s.code || s.lan || s.iso || '';
         const label = s.label || s.name || s.title || s.languageName || lang;
         const format = s.format || s.type || s.fileType || s.ext || '';
         const kind = String(s.trackType || s.mediaType || s.streamType || '').toLowerCase();
-        if (kind && (kind.includes('audio') || kind === 'video' || kind === 'video/')) continue;
+        if (kind && (kind.includes('audio') || kind === 'video')) continue;
         if (url) push(url, lang, label, format);
       }
     }
