@@ -424,7 +424,7 @@ function normalizeRows(data, fallback, forcedType) {
     const r = rows[i];
     if (!r || typeof r !== 'object') continue;
     const title = rowName(r, `${fallback} ${i + 1}`);
-    // Preferir assetList directo (como parseTree de Kino)
+    // Preferir assetList directo (como parseTree de Kino) — suele ser solo preview (~10)
     let items = [];
     if (Array.isArray(r.assetList) && r.assetList.length) {
       items = r.assetList.filter(x => x && typeof x === 'object').map(x => normalizeItem(x, forcedType));
@@ -432,11 +432,12 @@ function normalizeRows(data, fallback, forcedType) {
       items = flattenItems(r, forcedType);
     }
     const code = String(r.columnCode || r.recommendCode || r.code || '');
-    // id estable: columnId numérico, si no recommendCode/code, si no índice
-    let id = String(r.columnId || r.id || '');
-    if (!id || id === 'undefined') id = code || `cat_${i}`;
+    const rawCol = r.columnId ?? r.column_id ?? r.sectionId ?? r.recommendId ?? r.id;
+    const shelveId = /^\d+$/.test(String(rawCol || '')) ? String(rawCol) : '';
+    // id para el filtro de la app: preferir columnId numérico (sirve para getShelveData paginado)
+    let id = shelveId || code || `cat_${i}`;
     if (!items.length && !id && !code) continue;
-    out.push({ id, code, title, name: title, items: unique(items) });
+    out.push({ id, code, title, name: title, items: unique(items), shelveId });
   }
   return out;
 }
@@ -628,46 +629,40 @@ async function getCatalog(catalogId, options) {
   return getDiscover(Object.assign({}, opts, { kind }));
 }
 
+function rememberCategoryRow(row, kind) {
+  const key = String(row.id || row.code || '');
+  if (!key) return;
+  const entry = {
+    items: unique(row.items || []),
+    kind,
+    title: row.title || row.name || key,
+    code: row.code || '',
+    // columnId numérico para paginar con getShelveData (lista completa)
+    shelveId: row.shelveId || (/^\d+$/.test(key) ? key : '')
+  };
+  categoryItemsCache.set(key, entry);
+  if (row.code && String(row.code) !== key) categoryItemsCache.set(String(row.code), entry);
+  if (entry.shelveId && entry.shelveId !== key) categoryItemsCache.set(entry.shelveId, entry);
+  limitMap(categoryItemsCache, MAX_MAP);
+}
+
 async function categoryRows(kind) {
   const code = HOME[kind] || HOME.movies;
   const forcedType = kind === 'series' ? 'series' : kind === 'anime' ? 'anime' : 'movie';
-  // Igual que Kino: getNextColumns sobre masnew_movies / series / anime → recommendList + assetList
+  // Kino usa pageSize 60 en getNextColumns
   try {
-    const data = await api('getNextColumns', { columnCode: code, pageNum: 1, pageSize: 50, version: '' });
+    const data = await api('getNextColumns', { columnCode: code, pageNum: 1, pageSize: 60, version: '' });
     const rows = normalizeRows(data, kindLabel(kind), forcedType);
     const usable = rows.filter(r => (r.items && r.items.length) || r.id || r.code);
     if (usable.length) {
       categoryKindsFromRows(usable, kind);
-      for (const row of usable) {
-        const key = String(row.id || row.code);
-        if (!key) continue;
-        categoryItemsCache.set(key, {
-          items: unique(row.items || []),
-          kind,
-          title: row.title || row.name || key,
-          code: row.code || ''
-        });
-        if (row.code && row.code !== key) {
-          categoryItemsCache.set(String(row.code), categoryItemsCache.get(key));
-        }
-        limitMap(categoryItemsCache, MAX_MAP);
-      }
+      for (const row of usable) rememberCategoryRow(row, kind);
       return usable;
     }
   } catch (_) {}
   const rows = await homeRows(kind).catch(() => []);
   categoryKindsFromRows(rows, kind);
-  for (const row of rows) {
-    const key = String(row.id || row.code);
-    if (!key) continue;
-    categoryItemsCache.set(key, {
-      items: unique(row.items || []),
-      kind,
-      title: row.title || row.name || key,
-      code: row.code || ''
-    });
-    limitMap(categoryItemsCache, MAX_MAP);
-  }
+  for (const row of rows) rememberCategoryRow(row, kind);
   return rows.filter(r => r.id || r.code || (r.items && r.items.length));
 }
 
@@ -693,11 +688,10 @@ async function _getDiscoverFilters(filters) {
   const seen = new Set();
   for (let i = 0; i < kinds.length; i++) {
     for (const row of rowsByKind[i]) {
-      // Kino no exige columnId numérico: usa la sección del recommendList
-      const id = String(row.id || row.code || '');
+      // Preferir shelveId numérico para que la app pagine con getShelveData
+      const id = String(row.shelveId || row.id || row.code || '');
       if (!id || seen.has(id)) continue;
-      // Solo categorías que ya traen contenido (assetList) o id válido
-      if (!(row.items && row.items.length) && !row.id && !row.code) continue;
+      if (!(row.items && row.items.length) && !row.id && !row.code && !row.shelveId) continue;
       seen.add(id);
       categoryKinds.set(id, kinds[i]);
       limitMap(categoryKinds, MAX_MAP);
@@ -705,10 +699,13 @@ async function _getDiscoverFilters(filters) {
         categoryKinds.set(String(row.code), kinds[i]);
         limitMap(categoryKinds, MAX_MAP);
       }
+      if (row.id && String(row.id) !== id) {
+        categoryKinds.set(String(row.id), kinds[i]);
+      }
       options.push({
         id,
         label: row.title || row.name || kindLabel(kinds[i]),
-        columnId: id,
+        columnId: String(row.shelveId || id),
         columnCode: String(row.code || ''),
         type: kinds[i] === 'movies' ? 'movie' : kinds[i]
       });
@@ -807,7 +804,7 @@ async function fetchShelvePage(columnId, forcedType, page, pageSize) {
 
 async function _getDiscover(options) {
   const opts = options && typeof options === 'object' ? options : {};
-  // UI: { page, type, category } — category = id de sección (como Kino browse sobre recommendList)
+  // UI: { page, type, category } — paginación real en servidor (getShelveData pageNum)
   const kind = resolveKind(opts.type || opts.kind || 'movie');
   const page = Math.max(1, parseInt(opts.page, 10) || 1);
   const pageSize = Math.min(30, Math.max(8, parseInt(opts.pageSize, 10) || 20));
@@ -838,36 +835,81 @@ async function _getDiscover(options) {
     selected = '';
   }
 
-  // Asegurar árbol de categorías cargado (getNextColumns + assetList, estilo Kino)
   let rows = await categoryRows(rootKey).catch(() => []);
   if (!selected) {
     const first = rows.find(r => r.id || r.code);
     if (first) selected = String(first.id || first.code);
   }
 
-  // Resolver por id, code o título
+  let found = null;
   if (selected) {
-    const found = rows.find(r =>
+    found = rows.find(r =>
       String(r.id) === selected ||
       String(r.code) === selected ||
       r.title === selected ||
       r.name === selected
-    );
+    ) || null;
     if (found) selected = String(found.id || found.code);
   }
 
-  // 1) Caché de assetList de esa categoría (principal, como Kino)
-  let cached = categoryItemsCache.get(selected);
-  if ((!cached || !cached.items.length) && selected) {
-    // Reintentar carga del árbol por si el filtro cambió de tipo
-    rows = await categoryRows(rootKey).catch(() => []);
-    const found = rows.find(r => String(r.id) === selected || String(r.code) === selected);
-    if (found && found.items && found.items.length) {
-      cached = { items: unique(found.items), kind: rootKey, title: found.title };
-      categoryItemsCache.set(selected, cached);
+  const cached = categoryItemsCache.get(selected) || (found ? {
+    items: found.items || [],
+    shelveId: found.shelveId || (/^\d+$/.test(String(found.id || '')) ? String(found.id) : ''),
+    code: found.code || '',
+    kind: rootKey,
+    title: found.title
+  } : null);
+
+  // shelveId numérico → lista completa paginada en el portal (no el preview de 10 del árbol)
+  const shelveId = (cached && cached.shelveId) ||
+    (found && found.shelveId) ||
+    (/^\d+$/.test(selected) ? selected : '');
+
+  if (shelveId && /^\d+$/.test(shelveId)) {
+    const pageResult = await fetchShelvePage(shelveId, forcedType, page, pageSize);
+    if (pageResult.items.length || pageResult.hasMore || pageResult.total) {
+      return pageResult;
     }
   }
 
+  // Si hay columnCode de sección, pedir más páginas del árbol de esa columna
+  const sectionCode = (cached && cached.code) || (found && found.code) || '';
+  if (sectionCode) {
+    try {
+      const data = await api('getNextColumns', {
+        columnCode: sectionCode,
+        pageNum: page,
+        pageSize,
+        version: ''
+      });
+      let items = [];
+      if (Array.isArray(data.assetList)) {
+        items = data.assetList.filter(x => x && typeof x === 'object').map(x => normalizeItem(x, forcedType));
+      }
+      if (!items.length) {
+        const sub = normalizeRows(data, sectionCode, forcedType);
+        items = unique(sub.flatMap(r => r.items || []));
+      }
+      items = unique(items).map(it => {
+        const t = forcedType || itemType(it);
+        if (it.id) {
+          itemKinds.set(it.id, t);
+          limitMap(itemKinds, MAX_MAP);
+        }
+        return Object.assign({}, it, { type: t, media_type: t });
+      });
+      if (items.length) {
+        return {
+          items: items.length > pageSize ? items.slice(0, pageSize) : items,
+          page,
+          hasMore: items.length >= pageSize,
+          total: (page - 1) * pageSize + items.length + (items.length >= pageSize ? pageSize : 0)
+        };
+      }
+    } catch (_) {}
+  }
+
+  // Preview del assetList del árbol (últimos ~10): solo si no hubo shelve/código
   if (cached && cached.items && cached.items.length) {
     const all = cached.items.map(it => {
       const t = forcedType || itemType(it);
@@ -881,25 +923,6 @@ async function _getDiscover(options) {
     const pageItems = all.slice(start, start + pageSize);
     return {
       items: pageItems,
-      page,
-      hasMore: start + pageSize < all.length,
-      total: all.length
-    };
-  }
-
-  // 2) Fallback: getShelveData solo si hay columnId numérico (algunas secciones sí lo soportan)
-  if (selected && /^\d+$/.test(selected)) {
-    const pageResult = await fetchShelvePage(selected, forcedType, page, pageSize);
-    if (pageResult.items.length) return pageResult;
-  }
-
-  // 3) Último recurso: primera categoría del tipo con items
-  const withItems = rows.find(r => r.items && r.items.length);
-  if (withItems) {
-    const all = unique(withItems.items).map(it => Object.assign({}, it, { type: forcedType, media_type: forcedType }));
-    const start = (page - 1) * pageSize;
-    return {
-      items: all.slice(start, start + pageSize),
       page,
       hasMore: start + pageSize < all.length,
       total: all.length
