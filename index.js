@@ -1,4 +1,3 @@
-
 /*
  * Magis Service Catalog - optimizado + fixes:
  *  - Discover: filtros tipo + categoría funcionan juntos (no solo el primero)
@@ -675,12 +674,82 @@ async function _getDiscoverFilters(filters) {
   ];
 }
 
+/** Una página de estantería: solo lo que pide la app (page/pageSize), sin cargar todo de golpe */
+async function fetchShelvePage(columnId, forcedType, page, pageSize) {
+  const tryTypes = ['2', '1', '0'];
+  for (const columnType of tryTypes) {
+    try {
+      const data = await api('v3/getShelveData', {
+        columnId: String(columnId),
+        columnType,
+        pageNum: page,
+        pageSize,
+        encryptVersion: 0
+      });
+      let items = flattenItems(data, forcedType);
+      if (!items.length) {
+        items = normalizeRows(data, 'Catálogo', forcedType).flatMap(r => r.items || []);
+      }
+      items = unique(items).map(it => {
+        const t = forcedType || itemType(it);
+        if (it.id) {
+          itemKinds.set(it.id, t);
+          limitMap(itemKinds, MAX_MAP);
+        }
+        return Object.assign({}, it, { type: t, media_type: t });
+      });
+      const totalRaw = data.assetListTotalSize ?? data.listTotalSize ?? data.totalSize ?? data.total ?? data.count;
+      // El API ya pagina: no volver a cortar salvo que devuelva de más
+      const pageItems = items.length > pageSize ? items.slice(0, pageSize) : items;
+      const total = Number(totalRaw != null ? totalRaw : (page - 1) * pageSize + pageItems.length + (pageItems.length >= pageSize ? pageSize : 0));
+      const hasMore = totalRaw != null
+        ? page * pageSize < Number(totalRaw)
+        : pageItems.length >= pageSize;
+      if (pageItems.length || totalRaw != null) {
+        return { items: pageItems, page, hasMore, total: Number(total) || pageItems.length };
+      }
+    } catch (_) {}
+  }
+  // Algunas categorías son nodos de navegación: bajar un nivel y tomar assets de la primera hoja
+  try {
+    const data = await api('getNextColumns', {
+      columnCode: String(columnId),
+      pageNum: 1,
+      pageSize: 20,
+      version: ''
+    });
+    const rows = normalizeRows(data, 'Catálogo', forcedType);
+    for (const row of rows) {
+      const cid = String(row.id || '');
+      if (!/^\d+$/.test(cid)) continue;
+      const nested = await fetchShelvePage(cid, forcedType, page, pageSize);
+      if (nested.items.length) return nested;
+    }
+    // Si las filas ya traen items
+    const flat = unique(rows.flatMap(r => r.items || [])).map(it => {
+      const t = forcedType || itemType(it);
+      return Object.assign({}, it, { type: t, media_type: t });
+    });
+    if (flat.length) {
+      const start = (page - 1) * pageSize;
+      const pageItems = flat.slice(start, start + pageSize);
+      return {
+        items: pageItems,
+        page,
+        hasMore: start + pageSize < flat.length,
+        total: flat.length
+      };
+    }
+  } catch (_) {}
+  return { items: [], page, hasMore: false, total: 0 };
+}
+
 async function _getDiscover(options) {
   const opts = options && typeof options === 'object' ? options : {};
-  // UI pasa { page, type, category } mezclado en el mismo objeto
+  // UI: { page, type, category } en el mismo objeto
   const kind = resolveKind(opts.type || opts.kind || 'movie');
   const page = Math.max(1, parseInt(opts.page, 10) || 1);
-  const pageSize = 20;
+  const pageSize = Math.min(30, Math.max(8, parseInt(opts.pageSize, 10) || 20));
 
   let selected = String(
     opts.columnId ||
@@ -690,14 +759,28 @@ async function _getDiscover(options) {
     opts.filter ||
     ''
   ).trim();
-  if (selected === 'all' || selected === 'Todas las categorías' || selected === 'undefined' || selected === 'null') {
-    selected = '';
+  if (
+    !selected ||
+    selected === 'all' ||
+    selected === 'Todas las categorías' ||
+    selected === 'undefined' ||
+    selected === 'null' ||
+    selected === 'type' ||
+    selected === 'movie' ||
+    selected === 'series' ||
+    selected === 'anime'
+  ) {
+    // Evitar que un valor de "type" se confunda con categoría
+    if (['movie', 'series', 'anime', 'type'].includes(selected)) selected = '';
+    else if (selected === 'all' || selected === 'Todas las categorías' || selected === 'undefined' || selected === 'null') selected = '';
   }
 
   // Resolver código/nombre → columnId numérico
   if (selected && !/^\d+$/.test(selected)) {
     const mapped = categoryKinds.get(selected);
-    const searchKinds = mapped ? [mapped] : (kind === 'all' ? ['movies', 'series', 'anime'] : [kind === 'movies' ? 'movies' : kind]);
+    const searchKinds = mapped
+      ? [mapped]
+      : (kind === 'all' ? ['movies', 'series', 'anime'] : [kind === 'movies' ? 'movies' : kind]);
     for (const k of searchKinds) {
       const rows = await categoryRows(k).catch(() => []);
       const found = rows.find(r =>
@@ -713,103 +796,55 @@ async function _getDiscover(options) {
         break;
       }
     }
-    if (!/^\d+$/.test(selected)) {
-      return { items: [], page, hasMore: false, total: 0, error: 'Categoría sin columnId válido' };
+    if (selected && !/^\d+$/.test(selected)) {
+      selected = '';
     }
   }
 
+  const forcedFromKind = kind === 'anime' ? 'anime' : kind === 'series' ? 'series' : kind === 'movies' ? 'movie' : undefined;
+
+  // Categoría concreta
   if (selected && /^\d+$/.test(selected)) {
     const mapped = categoryKinds.get(selected);
     const inferred = mapped || (kind === 'all' ? '' : kind);
-    const forcedType = inferred === 'anime' ? 'anime' : inferred === 'series' ? 'series' : inferred === 'movies' || inferred === 'movie' ? 'movie' : undefined;
-    try {
-      const data = await api('v3/getShelveData', {
-        columnId: selected,
-        columnType: '2',
-        pageNum: page,
-        pageSize,
-        encryptVersion: 0
-      });
-      let items = flattenItems(data, forcedType);
-      if (!items.length) {
-        items = normalizeRows(data, 'Catálogo', forcedType).flatMap(r => r.items);
-      }
-      items = unique(items).map(it => {
-        const t = forcedType || itemType(it);
-        if (it.id) {
-          itemKinds.set(it.id, t);
-          limitMap(itemKinds, MAX_MAP);
-        }
-        return Object.assign({}, it, { type: t, media_type: t });
-      });
-      const totalRaw = data.assetListTotalSize ?? data.listTotalSize ?? data.totalSize ?? data.total ?? data.count;
-      const total = Number(totalRaw || items.length);
-      const start = (page - 1) * pageSize;
-      const pageItems = items.length > pageSize ? items.slice(start, start + pageSize) : items;
-      const hasMore = totalRaw != null ? page * pageSize < total : items.length >= pageSize;
-      return { items: pageItems, page, hasMore, total };
-    } catch (_) {
-      return { items: [], page, hasMore: false, total: 0 };
-    }
+    const forcedType = inferred === 'anime' ? 'anime'
+      : inferred === 'series' ? 'series'
+      : inferred === 'movies' || inferred === 'movie' ? 'movie'
+      : forcedFromKind;
+    const pageResult = await fetchShelvePage(selected, forcedType, page, pageSize);
+    if (pageResult.items.length || pageResult.total) return pageResult;
+    // Último recurso: no devolver vacío silencioso sin intentar raíz del tipo
   }
 
-  // Sin categoría concreta → raíz del tipo
+  // "Todas las categorías" / sin filtro → estantería raíz del tipo (paginada en el servidor)
   if (kind === 'all') {
-    const results = [];
-    for (const k of ['movies', 'series', 'anime']) {
-      results.push(await categoryRows(k).catch(() => []));
-    }
-    const rows = results.flat();
-    const items = unique(rows.flatMap(r => r.items)).map(it => Object.assign({}, it, { type: itemType(it), media_type: itemType(it) }));
-    const start = (page - 1) * pageSize;
-    return {
-      items: items.slice(start, start + pageSize),
-      page,
-      hasMore: start + pageSize < items.length,
-      total: items.length,
-      categories: rows.map(r => ({ id: r.id, name: r.name, code: r.code }))
-    };
+    // Mezcla ligera: solo página actual desde cada raíz, sin cargar catálogos enteros
+    const keys = ['movies', 'series', 'anime'];
+    const chunks = await Promise.all(keys.map(async k => {
+      const rootId = ROOT[k];
+      const ft = k === 'series' ? 'series' : k === 'anime' ? 'anime' : 'movie';
+      return fetchShelvePage(rootId, ft, page, Math.ceil(pageSize / 3));
+    }));
+    const items = unique(chunks.flatMap(c => c.items));
+    const hasMore = chunks.some(c => c.hasMore);
+    return { items: items.slice(0, pageSize), page, hasMore, total: items.length };
   }
 
   const rootKey = kind === 'anime' ? 'anime' : kind === 'series' ? 'series' : 'movies';
   const rootId = ROOT[rootKey] || ROOT.movies;
   const forcedType = rootKey === 'series' ? 'series' : rootKey === 'anime' ? 'anime' : 'movie';
-  try {
-    const data = await api('v3/getShelveData', {
-      columnId: rootId,
-      columnType: '2',
-      pageNum: page,
-      pageSize,
-      encryptVersion: 0
-    });
-    let items = flattenItems(data, forcedType);
-    if (!items.length) {
-      items = normalizeRows(data, kindLabel(rootKey), forcedType).flatMap(r => r.items);
-    }
-    items = unique(items).map(it => {
-      if (it.id) {
-        itemKinds.set(it.id, forcedType);
-        limitMap(itemKinds, MAX_MAP);
-      }
-      return Object.assign({}, it, { type: forcedType, media_type: forcedType });
-    });
-    const totalRaw = data.assetListTotalSize ?? data.listTotalSize ?? data.totalSize ?? data.total ?? data.count;
-    const total = Number(totalRaw || items.length);
-    const start = (page - 1) * pageSize;
-    const pageItems = items.length > pageSize ? items.slice(start, start + pageSize) : items;
-    const hasMore = totalRaw != null ? page * pageSize < total : items.length >= pageSize;
-    if (items.length || total) return { items: pageItems, page, hasMore, total };
-  } catch (_) {}
+  const rootPage = await fetchShelvePage(rootId, forcedType, page, pageSize);
+  if (rootPage.items.length || rootPage.hasMore) return rootPage;
 
+  // Fallback: home ya cacheado (pocos ítems), paginado en cliente solo como último recurso
   const rows = await homeRows(rootKey).catch(() => []);
-  const all = unique(rows.flatMap(r => r.items));
+  const all = unique(rows.flatMap(r => r.items || []));
   const start = (page - 1) * pageSize;
   return {
     items: all.slice(start, start + pageSize),
     page,
     hasMore: start + pageSize < all.length,
-    total: all.length,
-    categories: rows.map(r => ({ id: r.id, name: r.name, code: r.code }))
+    total: all.length
   };
 }
 
@@ -1036,7 +1071,7 @@ async function _getMeta(id, options) {
         const sid = String(sibling.contentId || sibling.id || '').trim();
         if (!sid || seen.has(sid)) continue;
         seen.add(sid);
-        const sn = Number(sibling.seasonNumber || sibling.season || parseSeasonFromName(sibling.name || sibling.title || '') || 0) || 0;
+        let sn = Number(sibling.seasonNumber || sibling.season || parseSeasonFromName(sibling.name || sibling.title || '') || 0) || 0;
         links.push({
           id: sid,
           number: sn,
@@ -1044,6 +1079,19 @@ async function _getMeta(id, options) {
           poster: sibling.poster || sibling.posterUrl || ''
         });
       }
+      // Si el portal no numera bien, asignar 1..N ordenando por nombre/id
+      const usedNums = new Set(seasons.map(s => Number(s.number)));
+      if (usedNums.has(currentSeason) === false && simple.length) usedNums.add(currentSeason);
+      let auto = 1;
+      for (const link of links) {
+        if (!link.number || usedNums.has(link.number)) {
+          while (usedNums.has(auto)) auto++;
+          link.number = auto;
+        }
+        usedNums.add(link.number);
+        auto = link.number + 1;
+      }
+
       for (const link of links.slice(0, 8)) {
         try {
           const sr = await api('v4/getItemData', {
@@ -1055,9 +1103,17 @@ async function _getMeta(id, options) {
           });
           const sd = unwrapDetail(sr);
           const seasonNum = link.number || Number(sd.seasonNumber || sd.season || parseSeasonFromName(link.name) || seasons.length + 1) || 1;
-          // Indexar con el parent (item.id) Y con el sibling id
-          const eps = episodeRows(sd, item.id, seasonNum);
+          // Forzar season en cada episodio = seasonNum (aunque el portal diga otra cosa)
+          let eps = episodeRows(sd, item.id, seasonNum);
+          eps = eps.map(ep => Object.assign({}, ep, { season: seasonNum, seriesContentId: item.id }));
           episodeRows(sd, link.id, seasonNum);
+          // Indexar explícito T-N bajo el id de la ficha abierta
+          for (const ep of eps) {
+            episodeContentIds.set(`${item.id}:${seasonNum}:${Number(ep.number)}`, String(ep.id));
+            episodeContentIds.set(`${link.id}:${seasonNum}:${Number(ep.number)}`, String(ep.id));
+            episodeParent.set(String(ep.id), String(item.id));
+          }
+          limitMap(episodeContentIds, MAX_MAP);
           const existing = seasons.find(x => x.number === seasonNum);
           if (existing) {
             if (!existing.episodes.length) existing.episodes = eps;
@@ -1095,9 +1151,42 @@ async function _getMeta(id, options) {
       });
     }
 
+    // Garantizar Temporada 1: si solo hay T2+ y un sibling sin número, promover el de menor número o el actual si es 1
+    if (isSeries && seasons.length && !seasons.some(s => Number(s.number) === 1)) {
+      // Renumerar la temporada con más episodios "base" o la de menor número a 1 si currentSeason era mal etiquetada
+      seasons.sort((a, b) => Number(a.number) - Number(b.number));
+      const first = seasons[0];
+      if (first && Number(first.number) !== 1) {
+        const oldN = Number(first.number);
+        first.number = 1;
+        first.season = 1;
+        first.name = first.name && /temporada/i.test(first.name) ? 'Temporada 1' : (first.name || 'Temporada 1');
+        first.title = first.name;
+        for (const ep of first.episodes || []) {
+          ep.season = 1;
+          episodeContentIds.set(`${item.id}:1:${Number(ep.number)}`, String(ep.id || ep.contentId));
+          if (oldN) episodeContentIds.set(`${item.id}:${oldN}:${Number(ep.number)}`, String(ep.id || ep.contentId));
+        }
+      }
+    }
+
     seasons.sort((a, b) => Number(a.number) - Number(b.number));
+    // Re-indexar todas las temporadas bajo item.id para que getStreams(seriesId, S, E) siempre resuelva
+    for (const s of seasons) {
+      const sn = Number(s.number) || 1;
+      for (const ep of s.episodes || []) {
+        const eid = String(ep.id || ep.contentId || '');
+        if (!eid) continue;
+        ep.season = sn;
+        ep.seriesContentId = item.id;
+        episodeContentIds.set(`${item.id}:${sn}:${Number(ep.number)}`, eid);
+        episodeParent.set(eid, String(item.id));
+      }
+    }
+    limitMap(episodeContentIds, MAX_MAP);
+
     item.seasons = seasons;
-    item.episodes = simple;
+    item.episodes = seasons.length ? (seasons.find(s => Number(s.number) === currentSeason) || seasons[0]).episodes : simple;
     item.seasonSiblings = siblings;
     item.genres = item.genres || [];
     rememberEpisodeMap(item.id, seasons);
@@ -1109,27 +1198,60 @@ async function _getMeta(id, options) {
   });
 }
 
-/** Extrae subtítulos de cualquier forma que devuelva Magis en el play payload */
-function extractSubtitles(...sources) {
+function normalizeSubLang(raw) {
+  const s = String(raw || '').trim().toLowerCase();
+  if (!s || s === 'und' || s === 'unknown' || s === 'null') return { code: 'es', label: 'Español' };
+  if (/^(es|spa|spanish|español|castellano)/.test(s)) return { code: 'es', label: 'Español' };
+  if (/^(en|eng|english|inglés|ingles)/.test(s)) return { code: 'en', label: 'English' };
+  if (/^(pt|por|portuguese|portugu)/.test(s)) return { code: 'pt', label: 'Português' };
+  if (/^(fr|fre|french|franc)/.test(s)) return { code: 'fr', label: 'Français' };
+  if (/^(de|ger|german|alem)/.test(s)) return { code: 'de', label: 'Deutsch' };
+  if (/^(it|ita|italian)/.test(s)) return { code: 'it', label: 'Italiano' };
+  if (/^(zh|chi|chinese|mandarin)/.test(s)) return { code: 'zh', label: '中文' };
+  if (/^(ja|jpn|japanese|japon)/.test(s)) return { code: 'ja', label: '日本語' };
+  if (/^(ko|kor|korean|corean)/.test(s)) return { code: 'ko', label: '한국어' };
+  if (s.length <= 3) return { code: s, label: s.toUpperCase() };
+  return { code: s.slice(0, 2), label: String(raw) };
+}
+
+/** Extrae subtítulos; baseUrl opcional para armar URLs absolutas (el player no manda headers en subs) */
+function extractSubtitles(baseUrl, ...sources) {
   const out = [];
   const seen = new Set();
+  const base = String(baseUrl || '').replace(/\/$/, '');
+
+  const absolutize = (url) => {
+    let u = String(url || '').trim();
+    if (!u) return '';
+    if (/^https?:\/\//i.test(u)) return u;
+    if (u.startsWith('//')) return 'https:' + u;
+    if (!base) return u;
+    if (u.startsWith('/')) return base + u;
+    return base + '/' + u;
+  };
+
   const push = (url, lang, label, format) => {
-    const u = String(url || '').trim();
+    const u = absolutize(url);
     if (!u || seen.has(u)) return;
+    // El player descarga el subtítulo por HTTP sin auth: solo URLs http(s)
+    if (!/^https?:\/\//i.test(u)) return;
     seen.add(u);
-    let fmt = format || '';
+    let fmt = String(format || '').toLowerCase().replace(/^\./, '');
     const lower = u.toLowerCase();
-    if (!fmt) {
+    if (!fmt || fmt === 'text' || fmt === 'file') {
       if (lower.includes('.vtt')) fmt = 'vtt';
       else if (lower.includes('.srt')) fmt = 'srt';
       else if (lower.includes('.ass') || lower.includes('.ssa')) fmt = 'ass';
-      else fmt = 'vtt';
+      else fmt = 'srt';
     }
+    const nl = normalizeSubLang(lang || label);
     out.push({
       url: u,
-      lang: String(lang || 'und'),
-      label: String(label || lang || 'Subtítulo'),
-      format: fmt
+      lang: nl.code,
+      language: nl.code,
+      label: label && String(label).length > 1 && !/^und$/i.test(String(label)) ? String(label) : nl.label,
+      format: fmt,
+      type: fmt
     });
   };
 
@@ -1138,30 +1260,30 @@ function extractSubtitles(...sources) {
     const lists = [
       src.subtitleList, src.subtitles, src.subs, src.captionList, src.captions,
       src.lanList, src.languageList, src.subtitleInfoList, src.subTitleList,
-      src.trackList, src.tracks
+      src.trackList, src.tracks, src.subtitleTrackList, src.subList
     ];
     for (const list of lists) {
       if (!Array.isArray(list)) continue;
       for (const s of list) {
         if (!s) continue;
         if (typeof s === 'string') {
-          push(s, 'und', 'Subtítulo');
+          push(s, 'es', 'Español');
           continue;
         }
         if (typeof s !== 'object') continue;
-        const url = s.url || s.fileUrl || s.file || s.src || s.subtitleUrl || s.subUrl || s.path || s.address || '';
-        const lang = s.lang || s.language || s.languageCode || s.code || s.lan || s.iso || 'und';
+        const url = s.url || s.fileUrl || s.file || s.src || s.subtitleUrl || s.subUrl ||
+          s.path || s.address || s.downloadUrl || s.playUrl || s.uri || '';
+        const lang = s.lang || s.language || s.languageCode || s.code || s.lan || s.iso ||
+          s.languageName || s.langName || '';
         const label = s.label || s.name || s.title || s.languageName || lang;
-        const format = s.format || s.type || s.fileType || '';
-        // Algunos objetos son pistas de audio, no subtítulos
-        const kind = String(s.trackType || s.mediaType || s.type || '').toLowerCase();
-        if (kind && (kind.includes('audio') || kind === 'video')) continue;
+        const format = s.format || s.type || s.fileType || s.ext || '';
+        const kind = String(s.trackType || s.mediaType || s.streamType || '').toLowerCase();
+        if (kind && (kind.includes('audio') || kind === 'video' || kind === 'video/')) continue;
         if (url) push(url, lang, label, format);
       }
     }
-    // Campos planos
-    if (src.subtitleUrl) push(src.subtitleUrl, src.subtitleLang || 'und', src.subtitleName || 'Subtítulo');
-    if (src.subUrl) push(src.subUrl, 'und', 'Subtítulo');
+    if (src.subtitleUrl) push(src.subtitleUrl, src.subtitleLang || src.lang || 'es', src.subtitleName || 'Español');
+    if (src.subUrl) push(src.subUrl, 'es', 'Español');
   }
   return out;
 }
@@ -1169,32 +1291,53 @@ function extractSubtitles(...sources) {
 async function resolveEpisodePlayableId(seriesContentId, season, episode) {
   const sn = Number(season || 1) || 1;
   const en = Number(episode || 1) || 1;
-  const key = `${seriesContentId}:${sn}:${en}`;
-  let playableId = episodeContentIds.get(key) || '';
-  if (playableId) return playableId;
+  const candidates = [seriesContentId];
+  // También probar si el id que mandó la app es de otra temporada
+  for (const [k, v] of episodeContentIds) {
+    if (String(v) === String(seriesContentId) || k.startsWith(seriesContentId + ':')) {
+      const parent = k.split(':')[0];
+      if (parent && !candidates.includes(parent)) candidates.push(parent);
+    }
+  }
+  for (const parent of candidates) {
+    const key = `${parent}:${sn}:${en}`;
+    const hit = episodeContentIds.get(key);
+    if (hit) return hit;
+  }
 
-  // Rebuild desde meta (incluye siblings / otras temporadas)
   try {
     const meta = await getMeta(seriesContentId, { type: 'series' });
-    playableId = episodeContentIds.get(key) || '';
-    if (playableId) return playableId;
+    for (const parent of [seriesContentId, meta && meta.id, meta && meta.contentId].filter(Boolean)) {
+      const key = `${parent}:${sn}:${en}`;
+      const hit = episodeContentIds.get(key);
+      if (hit) return hit;
+    }
     if (meta && Array.isArray(meta.seasons)) {
-      const foundSeason = meta.seasons.find(x => Number(x.number) === sn);
+      // Preferir temporada pedida; si es T1 y solo hay datos en sibling, ya están indexados
+      let foundSeason = meta.seasons.find(x => Number(x.number) === sn);
+      if (!foundSeason && sn === 1) {
+        foundSeason = meta.seasons.find(x => Number(x.number) === 1) || meta.seasons[0];
+      }
       if (foundSeason && Array.isArray(foundSeason.episodes)) {
-        const foundEp = foundSeason.episodes.find(x => Number(x.number) === en);
+        const foundEp = foundSeason.episodes.find(x => Number(x.number) === en) ||
+          foundSeason.episodes.find(x => Number(x.episode) === en);
         if (foundEp && (foundEp.id || foundEp.contentId)) {
-          playableId = String(foundEp.id || foundEp.contentId);
-          episodeContentIds.set(key, playableId);
-          episodeParent.set(playableId, seriesContentId);
+          const playableId = String(foundEp.id || foundEp.contentId);
+          episodeContentIds.set(`${seriesContentId}:${sn}:${en}`, playableId);
+          // Alias: si la app abrió desde otra temporada, también indexar
+          if (meta.id && String(meta.id) !== String(seriesContentId)) {
+            episodeContentIds.set(`${meta.id}:${sn}:${en}`, playableId);
+          }
+          episodeParent.set(playableId, String(seriesContentId));
           limitMap(episodeContentIds, MAX_MAP);
           return playableId;
         }
       }
-      // Temporada no cargada: intentar sibling por número
+      // Cargar sibling de la temporada pedida bajo demanda
       const sibling = (meta.seasonSiblings || []).find(s => {
         const n = Number(s.seasonNumber || s.season || parseSeasonFromName(s.name || s.title || '') || 0);
         return n === sn;
-      });
+      }) || (sn === 1 ? (meta.seasonSiblings || [])[0] : null);
       if (sibling) {
         const sid = String(sibling.contentId || sibling.id || '');
         if (sid) {
@@ -1207,10 +1350,20 @@ async function resolveEpisodePlayableId(seriesContentId, season, episode) {
               macAddr: FIXED_MAC
             });
             const sd = unwrapDetail(sr);
-            episodeRows(sd, seriesContentId, sn);
+            const eps = episodeRows(sd, seriesContentId, sn);
             episodeRows(sd, sid, sn);
-            playableId = episodeContentIds.get(key) || '';
+            // Forzar mapeo T1 si el portal no manda seasonNumber
+            if (sn === 1 && eps.length) {
+              for (const ep of eps) {
+                episodeContentIds.set(`${seriesContentId}:1:${Number(ep.number)}`, String(ep.id));
+                episodeParent.set(String(ep.id), String(seriesContentId));
+              }
+            }
+            const key = `${seriesContentId}:${sn}:${en}`;
+            const playableId = episodeContentIds.get(key) || '';
             if (playableId) return playableId;
+            const byNum = eps.find(e => Number(e.number) === en);
+            if (byNum) return String(byNum.id);
           } catch (_) {}
         }
       }
@@ -1282,9 +1435,6 @@ async function _getStreams(id, type, season, episode) {
   const license = licenses.length ? String(licenses[0].license || '') : '';
   if (!license) return [];
 
-  // Subtítulos de todo el payload de play + media
-  const subtitles = extractSubtitles(play, media, ...(mediaCandidates || []), ...(episodeList || []));
-
   const slb = await api('v14/getSlbInfo', {
     hasPay: '0',
     userIdentity: '1',
@@ -1318,6 +1468,15 @@ async function _getStreams(id, type, season, episode) {
   const mediaId = String(media.contentId || playableId || parentId);
   const url = `${base}/vod/${mediaId}_media.${ext}`;
 
+  // Subtítulos con URL absoluta (el player descarga sin headers de auth)
+  const subtitles = extractSubtitles(
+    base,
+    play,
+    media,
+    ...(mediaCandidates || []),
+    ...(episodeList || [])
+  );
+
   return [{
     name: 'Magis Service',
     title: 'Magis Service',
@@ -1334,7 +1493,6 @@ async function _getStreams(id, type, season, episode) {
     },
     language: 'Español',
     isHls: false,
-    // Formato que parsea StreamServer.fromJson de tu app
     subtitles,
     subs: subtitles,
     captions: subtitles
