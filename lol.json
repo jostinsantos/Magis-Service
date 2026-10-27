@@ -1,0 +1,31 @@
+{
+  "id": "magis-service-catalog",
+  "name": "Magis Service Catalog",
+  "version": "1.5.0",
+  "description": "Port de MagisCatalog optimizado: caché, llamadas agrupadas, paginación y reproducción de episodios.",
+  "author": "Community",
+  "entry": "index.js",
+  "languages": [
+    "Latino",
+    "Castellano",
+    "Español"
+  ],
+  "capabilities": [
+    "home",
+    "discover",
+    "search",
+    "meta",
+    "streams",
+    "news",
+    "catalogs"
+  ],
+  "config": [
+    
+    {
+      "key": "newsLimit",
+      "label": "Máximo de novedades",
+      "type": "number",
+      "default": "12"
+    }
+  ]
+}
