@@ -1,6 +1,6 @@
 {
   "id": "magis-service-catalog",
-  "name": "Magis Service Catalog",
+  "name": "XuperTv",
   "version": "0.1.1",
   "description": "Port de MagisCatalog optimizado: caché, llamadas agrupadas, paginación y reproducción de episodios.",
   "author": "JostinSantos",
