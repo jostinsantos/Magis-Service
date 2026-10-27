@@ -3,6 +3,13 @@
  *  - Discover: filtros tipo + categoría funcionan juntos (no solo el primero)
  *  - Episodios de otras temporadas: resuelve contentId real del capítulo
  *  - Subtítulos: extrae todos los tracks del play response para el player
+ *
+ * Perf (Home / Buscar / Descubrir) — sin cambiar la extracción de datos Magis:
+ *  - Home: homeRows de movies/series/anime en paralelo
+ *  - Descubrir: ROOT directo si no hay categoría; menos beans getShelveData;
+ *    pageSize bajo en filtros; posters (imageStyle poster) no banner
+ *  - Caché TTL un poco más larga en home/discover
+ *  - TMDB opcional (config.tmdbApiKey): solo stills de capítulos ya listados por Magis
  */
 'use strict';
 
@@ -13,7 +20,9 @@ const DEFAULTS = {
   appId: 'com.android.msandroid',
   apkVersion: '49902',
   desKeyHex: 'e7af1ed7de1ffddd7bd3fe37ebdffde9ef3fe1ae39edfeb8',
-  newsLimit: '12'
+  newsLimit: '12',
+  // TMDB: enriquece títulos/overview/stills de capítulos + logo para player
+  tmdbApiKey: 'a2d9bbed370d9f678e34006f8750a5a5'
 };
 const API_VERSION = '43404';
 const SPKG_VERSION = '2025-08-07 05:40:11_36_16_';
@@ -48,11 +57,11 @@ const episodeSeasonId = new Map();
 const categoryItemsCache = new Map();
 
 const CACHE_TTL = {
-  getHome: 4 * 60e3,
-  getNextColumns: 4 * 60e3,
-  'v3/getShelveData': 2 * 60e3,
-  'v3/getRecommends': 6 * 60e3,
-  'v3/searchByName': 25e3,
+  getHome: 8 * 60e3,
+  getNextColumns: 8 * 60e3,
+  'v3/getShelveData': 3 * 60e3,
+  'v3/getRecommends': 8 * 60e3,
+  'v3/searchByName': 30e3,
   'v4/getItemData': 6 * 60e3,
   'v14/getSlbInfo': 8 * 60e3
 };
@@ -503,6 +512,7 @@ async function homeRows(kind) {
   const code = HOME[kind] || HOME.movies;
   const forcedType = kind === 'series' ? 'series' : kind === 'anime' ? 'anime' : 'movie';
   return cached('homeRows:' + kind, CACHE_TTL.getHome, async () => {
+    // 1) getHome (rápido). Solo si timeout → no insistir en cadena larga.
     try {
       const data = await api('getHome', { homePageCode: code, version: '' });
       const rows = normalizeRows(data, kindLabel(kind), forcedType);
@@ -513,7 +523,7 @@ async function homeRows(kind) {
     } catch (e) {
       if (timeoutError(e)) return [];
     }
-    // Home ligero: pocas columnas; el catálogo completo va en Descubrir
+    // 2) Un solo fallback ligero (pageSize 8). Sin tercer intento en cold path.
     try {
       const data = await api('getNextColumns', { columnCode: code, pageNum: 1, pageSize: 8, version: '' });
       const rows = normalizeRows(data, kindLabel(kind), forcedType);
@@ -524,6 +534,7 @@ async function homeRows(kind) {
     } catch (e) {
       if (timeoutError(e)) return [];
     }
+    // 3) Último recurso: una página de la raíz (solo si los anteriores no dieron filas)
     try {
       const rootId = ROOT[kind] || ROOT.movies;
       const data = await api('v3/getShelveData', {
@@ -581,23 +592,22 @@ async function _getNews() {
 }
 
 async function _getHome() {
-  // Carga perezosa: solo lo que la app pide en getHome.
-  // Pocas filas por tipo + banners horizontales (backdrop), no posters verticales.
+  // Paraleliza los 3 tipos (el rateQueue sigue serializando el portal).
+  // Misma forma de filas/ítems; menos tiempo de pared en cold start.
   const kinds = ['movies', 'series', 'anime'];
+  const results = await Promise.all(kinds.map(k => homeRows(k).catch(() => [])));
   const rows = [];
-  for (const kind of kinds) {
-    try {
-      const result = await homeRows(kind);
-      for (const row of result) {
-        rows.push(Object.assign({}, row, {
-          type: 'row',
-          categoryType: kind === 'movies' ? 'movie' : kind,
-          category: row.title,
-          // Banner horizontal (la app usa imageStyle === 'backdrop' | 'banner')
-          imageStyle: 'backdrop'
-        }));
-      }
-    } catch (_) {}
+  for (let i = 0; i < kinds.length; i++) {
+    const kind = kinds[i];
+    for (const row of results[i] || []) {
+      rows.push(Object.assign({}, row, {
+        type: 'row',
+        categoryType: kind === 'movies' ? 'movie' : kind,
+        category: row.title,
+        // Home sigue en banner horizontal
+        imageStyle: 'backdrop'
+      }));
+    }
   }
   const news = await getNews().catch(() => []);
   if (news.length) {
@@ -649,9 +659,9 @@ function rememberCategoryRow(row, kind) {
 async function categoryRows(kind) {
   const code = HOME[kind] || HOME.movies;
   const forcedType = kind === 'series' ? 'series' : kind === 'anime' ? 'anime' : 'movie';
-  // Kino usa pageSize 60 en getNextColumns
+  // Solo necesitamos nombres/IDs de categoría para filtros → pageSize bajo (menos payload/CPU)
   try {
-    const data = await api('getNextColumns', { columnCode: code, pageNum: 1, pageSize: 60, version: '' });
+    const data = await api('getNextColumns', { columnCode: code, pageNum: 1, pageSize: 12, version: '' });
     const rows = normalizeRows(data, kindLabel(kind), forcedType);
     const usable = rows.filter(r => (r.items && r.items.length) || r.id || r.code);
     if (usable.length) {
@@ -680,10 +690,7 @@ async function _getDiscoverFilters(filters) {
     { id: 'anime', label: 'Animación' }
   ];
   const kinds = kind === 'all' ? ['movies', 'series', 'anime'] : [kind === 'movies' ? 'movies' : kind];
-  const rowsByKind = [];
-  for (const k of kinds) {
-    rowsByKind.push(await categoryRows(k).catch(() => []));
-  }
+  const rowsByKind = await Promise.all(kinds.map(k => categoryRows(k).catch(() => [])));
   const options = [];
   const seen = new Set();
   for (let i = 0; i < kinds.length; i++) {
@@ -740,13 +747,10 @@ async function fetchShelvePage(columnId, forcedType, page, pageSize) {
     return { items: [], page, hasMore: false, total: 0 };
   }
 
+  // Solo 2 beans (el portal acepta num o string). Evita 6 intentos rate-limited en frío.
   const beans = [
     { columnId: idNum, columnType: '2', pageNum: page, pageSize, encryptVersion: 0 },
-    { columnId: idStr, columnType: '2', pageNum: page, pageSize, encryptVersion: 0 },
-    { columnId: idNum, columnType: 2, pageNum: page, pageSize, encryptVersion: 0 },
-    { columnId: idNum, columnType: '1', pageNum: page, pageSize, encryptVersion: 0 },
-    { columnId: idNum, columnType: '0', pageNum: page, pageSize, encryptVersion: 0 },
-    { columnId: idNum, columnType: '2', pageNum: page, pageSize }
+    { columnId: idStr, columnType: '2', pageNum: page, pageSize, encryptVersion: 0 }
   ];
 
   for (const bean of beans) {
@@ -765,14 +769,21 @@ async function fetchShelvePage(columnId, forcedType, page, pageSize) {
           itemKinds.set(it.id, t);
           limitMap(itemKinds, MAX_MAP);
         }
-        return Object.assign({}, it, { type: t, media_type: t });
+        // Descubrir: posters verticales (no banner)
+        const poster = it.poster || it.image || it.backdrop || '';
+        return Object.assign({}, it, {
+          type: t,
+          media_type: t,
+          poster,
+          image: poster,
+          imageStyle: 'poster'
+        });
       });
       const totalRaw = data.assetListTotalSize ?? data.listTotalSize ?? data.totalSize ?? data.total ?? data.count;
       const pageItems = items.length > pageSize ? items.slice(0, pageSize) : items;
       const total = totalRaw != null
         ? Number(totalRaw)
         : (page - 1) * pageSize + pageItems.length + (pageItems.length >= 10 ? pageSize : 0);
-      // Magis a menudo devuelve ~10 por página aunque pidas 20/40; sin total, asumir más si trajo un bloque lleno
       const hasMore = totalRaw != null
         ? page * pageSize < Number(totalRaw)
         : pageItems.length >= 10;
@@ -782,28 +793,13 @@ async function fetchShelvePage(columnId, forcedType, page, pageSize) {
     } catch (_) {}
   }
 
-  try {
-    const data = await api('getNextColumns', {
-      columnCode: idStr,
-      pageNum: 1,
-      pageSize: 60,
-      version: ''
-    });
-    const rows = normalizeRows(data, 'Catálogo', forcedType);
-    for (const row of rows) {
-      const cid = row.shelveId || (/^\d+$/.test(String(row.id || '')) ? String(row.id) : '');
-      if (!cid || cid === idStr) continue;
-      const nested = await fetchShelvePage(cid, forcedType, page, pageSize);
-      if (nested.items.length || nested.hasMore) return nested;
-    }
-  } catch (_) {}
-
+  // Sin cascada getNextColumns → nested fetchShelvePage (era muy pesada y duplicaba trabajo)
   return { items: [], page, hasMore: false, total: 0 };
 }
 
 async function _getDiscover(options) {
   const opts = options && typeof options === 'object' ? options : {};
-  // Paginación servidor: v3/getShelveData (igual que XPPC page())
+  // Paginación servidor: v3/getShelveData (igual extracción XPPC). Optimizado: ROOT directo si no hay categoría.
   const kind = resolveKind(opts.type || opts.kind || 'movie');
   const page = Math.max(1, parseInt(opts.page, 10) || 1);
   const pageSize = Math.min(40, Math.max(10, parseInt(opts.pageSize, 10) || 20));
@@ -834,13 +830,12 @@ async function _getDiscover(options) {
     selected = '';
   }
 
-  const rows = await categoryRows(rootKey).catch(() => []);
-
-  // Resolver a columnId numérico (único que pagina el portal)
   let shelveId = '';
   if (selected && /^\d+$/.test(selected)) {
     shelveId = selected;
   } else if (selected) {
+    // Resolver nombre/code → columnId solo si el usuario eligió categoría (no en cada página "todas")
+    const rows = await categoryRows(rootKey).catch(() => []);
     const found = rows.find(r =>
       String(r.id) === selected ||
       String(r.code) === selected ||
@@ -855,24 +850,34 @@ async function _getDiscover(options) {
     if (!shelveId && cached && cached.shelveId) shelveId = String(cached.shelveId);
   }
 
-  if (!shelveId) {
-    const first = rows.find(r => r.shelveId || /^\d+$/.test(String(r.id || '')));
-    if (first) shelveId = String(first.shelveId || first.id);
-  }
-  // Último recurso: raíz del tipo (76263 / 76235 / 76209)
+  // Sin categoría: ROOT fijo (evita getNextColumns extra en cada visita a Descubrir)
   if (!shelveId || !/^\d+$/.test(shelveId)) {
     shelveId = String(ROOT[rootKey] || ROOT.movies);
   }
 
-  // Siempre portal paginado — nunca quedarse en el preview de 10 del árbol
   const pageResult = await fetchShelvePage(shelveId, forcedType, page, pageSize);
-  if (pageResult.items.length || pageResult.hasMore) return pageResult;
+  if (pageResult.items.length || pageResult.hasMore) {
+    pageResult.items = (pageResult.items || []).map(it => {
+      const poster = it.poster || it.image || '';
+      return Object.assign({}, it, {
+        poster,
+        image: poster,
+        imageStyle: 'poster'
+      });
+    });
+    return pageResult;
+  }
 
-  // Si la categoría falló, intentar raíz del tipo (sigue siendo paginado)
   const rootId = String(ROOT[rootKey] || ROOT.movies);
   if (shelveId !== rootId) {
     const rootPage = await fetchShelvePage(rootId, forcedType, page, pageSize);
-    if (rootPage.items.length || rootPage.hasMore) return rootPage;
+    if (rootPage.items.length || rootPage.hasMore) {
+      rootPage.items = (rootPage.items || []).map(it => {
+        const poster = it.poster || it.image || '';
+        return Object.assign({}, it, { poster, image: poster, imageStyle: 'poster' });
+      });
+      return rootPage;
+    }
   }
 
   return { items: [], page, hasMore: false, total: 0 };
@@ -1018,6 +1023,236 @@ function rememberEpisodeMap(parentId, seasons) {
   }
   limitMap(episodeContentIds, MAX_MAP);
   limitMap(episodeParent, MAX_MAP);
+}
+
+
+// ─── TMDB (enriquecimiento; nunca bloquea si falla) ─────────────────────────
+const TMDB_BASE = 'https://api.themoviedb.org/3';
+const TMDB_IMG = 'https://image.tmdb.org/t/p';
+const tmdbCache = new Map();
+
+function tmdbKey() {
+  try {
+    const k = String(config().tmdbApiKey || '').trim();
+    return k || 'a2d9bbed370d9f678e34006f8750a5a5';
+  } catch (_) {
+    return 'a2d9bbed370d9f678e34006f8750a5a5';
+  }
+}
+
+async function tmdbGet(path, params) {
+  const key = tmdbKey();
+  if (!key) return null;
+  const q = Object.assign({ api_key: key, language: 'es-MX' }, params || {});
+  const qs = Object.keys(q).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(String(q[k]))).join('&');
+  const url = TMDB_BASE + path + '?' + qs;
+  const ck = 'tmdb:' + path + ':' + qs;
+  const hit = tmdbCache.get(ck);
+  if (hit && hit.expires > Date.now()) return hit.value;
+  try {
+    const opts = { method: 'GET', headers: { Accept: 'application/json' } };
+    if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+      opts.signal = AbortSignal.timeout(7000);
+    }
+    const res = await fetch(url, opts);
+    if (!res.ok) return null;
+    const json = await res.json();
+    tmdbCache.set(ck, { value: json, expires: Date.now() + 45 * 60e3 });
+    limitMap(tmdbCache, 100);
+    return json;
+  } catch (_) {
+    return null;
+  }
+}
+
+function tmdbImg(path, size) {
+  if (!path || path === 'null') return '';
+  return TMDB_IMG + '/' + (size || 'w300') + path;
+}
+
+function pickLogo(images) {
+  if (!images || !Array.isArray(images.logos) || !images.logos.length) return '';
+  const logos = images.logos.filter(l => l && l.file_path);
+  if (!logos.length) return '';
+  // Preferir español, luego sin idioma, luego inglés, luego cualquiera
+  const rank = (l) => {
+    const lang = String(l.iso_639_1 || '');
+    if (lang === 'es') return 0;
+    if (!lang) return 1;
+    if (lang === 'en') return 2;
+    return 3;
+  };
+  logos.sort((a, b) => rank(a) - rank(b) || (b.vote_average || 0) - (a.vote_average || 0));
+  return tmdbImg(logos[0].file_path, 'w500');
+}
+
+function cleanTitleForSearch(name) {
+  return String(name || '')
+    .replace(/\s*[Tt]emp(orada)?\.?\s*\d+.*$/i, '')
+    .replace(/\s*[Ss]eason\s*\d+.*$/i, '')
+    .replace(/\s*\(\d{4}\)\s*$/, '')
+    .replace(/\s*[-–—]\s*(Latino|Castellano|Español|Sub\w*).*$/i, '')
+    .trim();
+}
+
+async function resolveTmdbId(item, isTv) {
+  const imdb = String(
+    (item.details && (item.details.keyWords || item.details.imdbId || item.details.imdb)) ||
+    item.imdb || item.imdbId || item.keyWords || ''
+  ).trim();
+  if (/^tt\d{7,}$/i.test(imdb)) {
+    const find = await tmdbGet('/find/' + imdb, { external_source: 'imdb_id' });
+    if (isTv) {
+      const tv = find && Array.isArray(find.tv_results) && find.tv_results[0];
+      if (tv && tv.id) return Number(tv.id) || 0;
+    } else {
+      const mov = find && Array.isArray(find.movie_results) && find.movie_results[0];
+      if (mov && mov.id) return Number(mov.id) || 0;
+    }
+  }
+  const title = cleanTitleForSearch(item.title || item.name);
+  if (title.length < 2) return 0;
+  const year = String(item.year || '').slice(0, 4);
+  if (isTv) {
+    const search = await tmdbGet('/search/tv', { query: title });
+    const hit = search && Array.isArray(search.results) && search.results[0];
+    return hit && hit.id ? Number(hit.id) || 0 : 0;
+  }
+  const params = { query: title };
+  if (/^\d{4}$/.test(year)) params.year = year;
+  const search = await tmdbGet('/search/movie', params);
+  const hit = search && Array.isArray(search.results) && search.results[0];
+  return hit && hit.id ? Number(hit.id) || 0 : 0;
+}
+
+/**
+ * Enriquece ficha Magis con TMDB:
+ *  - logo (player / UI)
+ *  - capítulos: título, overview, still, runtime (solo episodios que Magis ya listó)
+ * No cambia IDs ni estructura Magis.
+ */
+async function enrichEpisodeStillsFromTmdb(item) {
+  if (!item) return item;
+  const isSeries = item.type === 'series' || item.type === 'anime' ||
+    (Array.isArray(item.seasons) && item.seasons.length > 0);
+  try {
+    if (isSeries) {
+      const tvId = await resolveTmdbId(item, true);
+      if (!tvId) return item;
+
+      // Detalle + imágenes en paralelo (logo + overview/backdrop si faltan)
+      const [detail, images] = await Promise.all([
+        tmdbGet('/tv/' + tvId, {}),
+        tmdbGet('/tv/' + tvId + '/images', { include_image_language: 'es,en,null' })
+      ]);
+      const logo = pickLogo(images);
+      if (logo) {
+        item.logo = logo;
+        item.clearlogo = logo;
+      }
+      if (detail) {
+        if (!item.overview && detail.overview) {
+          item.overview = String(detail.overview);
+          item.description = item.overview;
+        }
+        if (!item.backdrop && detail.backdrop_path) {
+          item.backdrop = tmdbImg(detail.backdrop_path, 'w1280');
+          item.background = item.backdrop;
+        }
+        if ((!item.poster || !item.poster.length) && detail.poster_path) {
+          item.poster = tmdbImg(detail.poster_path, 'w500');
+          item.image = item.poster;
+        }
+        if (detail.name) {
+          item.tmdbTitle = String(detail.name);
+        }
+        item.tmdbId = tvId;
+      }
+
+      if (!Array.isArray(item.seasons) || !item.seasons.length) return item;
+
+      const seasons = item.seasons.slice(0, 8);
+      await Promise.all(seasons.map(async (s) => {
+        const sn = Number(s.number || s.season || 1) || 1;
+        const body = await tmdbGet('/tv/' + tvId + '/season/' + sn, {});
+        if (!body || !Array.isArray(body.episodes)) return;
+        const byNum = new Map();
+        for (const e of body.episodes) {
+          const n = Number(e.episode_number);
+          if (n) byNum.set(n, e);
+        }
+        for (const ep of s.episodes || []) {
+          const n = Number(ep.number || ep.episode || 0);
+          const te = byNum.get(n);
+          if (!te) continue;
+          // Título Magis → título TMDB (lo que la app muestra en lista de capítulos)
+          const tmdbName = String(te.name || '').trim();
+          if (tmdbName) {
+            ep.title = tmdbName;
+            ep.name = tmdbName;
+          }
+          const ov = String(te.overview || '').trim();
+          if (ov) {
+            ep.overview = ov;
+            ep.description = ov;
+          }
+          const still = tmdbImg(te.still_path, 'w300');
+          if (still) {
+            ep.still = still;
+            ep.poster = still;
+            ep.image = still;
+          }
+          const rt = Number(te.runtime);
+          if (rt > 0 && rt < 1000) {
+            ep.runtime = rt;
+            ep.duration = rt;
+          }
+          if (te.air_date) {
+            ep.airDate = String(te.air_date);
+            ep.air_date = ep.airDate;
+          }
+        }
+      }));
+
+      if (Array.isArray(item.episodes) && item.seasons.length) {
+        const curSn = Number((item.episodes[0] && item.episodes[0].season) || 1) || 1;
+        const cur = item.seasons.find(s => Number(s.number) === curSn) || item.seasons[0];
+        if (cur && cur.episodes && cur.episodes.length) item.episodes = cur.episodes;
+      }
+    } else {
+      // Película: logo + overview/poster si faltan
+      const movieId = await resolveTmdbId(item, false);
+      if (!movieId) return item;
+      const [detail, images] = await Promise.all([
+        tmdbGet('/movie/' + movieId, {}),
+        tmdbGet('/movie/' + movieId + '/images', { include_image_language: 'es,en,null' })
+      ]);
+      const logo = pickLogo(images);
+      if (logo) {
+        item.logo = logo;
+        item.clearlogo = logo;
+      }
+      if (detail) {
+        item.tmdbId = movieId;
+        if (!item.overview && detail.overview) {
+          item.overview = String(detail.overview);
+          item.description = item.overview;
+        }
+        if (!item.backdrop && detail.backdrop_path) {
+          item.backdrop = tmdbImg(detail.backdrop_path, 'w1280');
+          item.background = item.backdrop;
+        }
+        if ((!item.poster || !item.poster.length) && detail.poster_path) {
+          item.poster = tmdbImg(detail.poster_path, 'w500');
+          item.image = item.poster;
+        }
+        if (detail.runtime > 0) {
+          item.runtime = Number(detail.runtime);
+        }
+      }
+    }
+  } catch (_) {}
+  return item;
 }
 
 async function _getMeta(id, options) {
@@ -1248,6 +1483,10 @@ async function _getMeta(id, options) {
       itemKinds.set(item.id, type);
       limitMap(itemKinds, MAX_MAP);
     }
+    // Post-proceso opcional: stills TMDB solo para capítulos que Magis ya listó
+    try {
+      await enrichEpisodeStillsFromTmdb(item);
+    } catch (_) {}
     return item;
   });
 }
@@ -1609,7 +1848,7 @@ async function getNews() {
   return cached('public:getNews', 90e3, () => _getNews());
 }
 async function getHome() {
-  return cached('public:getHome', 50e3, () => _getHome());
+  return cached('public:getHome', 3 * 60e3, () => _getHome());
 }
 async function getDiscoverFilters(filters) {
   const opts = filters && typeof filters === 'object' ? filters : {};
@@ -1623,7 +1862,7 @@ async function getDiscover(options) {
   const type = resolveKind(opts.type || opts.kind || 'movie');
   const cat = String(opts.category || opts.columnId || opts.categoryId || opts.filter || 'all');
   const page = parseInt(opts.page, 10) || 1;
-  return cached(`public:getDiscover:${type}:${cat}:${page}`, 40e3, () => _getDiscover(opts));
+  return cached(`public:getDiscover:${type}:${cat}:${page}`, 90e3, () => _getDiscover(opts));
 }
 async function getMeta(id, options) {
   const keyId = id && typeof id === 'object' ? (id.contentId || id.id || id.assetId || id.programId || JSON.stringify(id)) : String(id || '');
