@@ -38,8 +38,12 @@ const categoryKinds = new Map();
 const itemKinds = new Map();
 // parentSeriesId:season:episode -> episode contentId
 const episodeContentIds = new Map();
-// episode contentId -> parent series contentId (ayuda cuando el host manda el id del capítulo)
+// episode contentId -> parent series contentId
 const episodeParent = new Map();
+// parentSeriesId:seasonNumber -> contentId de esa temporada en Magis
+const seasonContentIds = new Map();
+// episode contentId -> contentId de su temporada (startPlayVOD.seriesContentId)
+const episodeSeasonId = new Map();
 
 const CACHE_TTL = {
   getHome: 4 * 60e3,
@@ -628,12 +632,12 @@ async function categoryRows(kind) {
 }
 
 /**
- * La UI envía filters = { type: 'movie'|'series'|'anime', category: 'all'|columnId }
- * Al cambiar type recarga filtros para refrescar categorías del tipo elegido.
+ * La UI envía filters = { type: 'movie'|'series'|'anime', category: columnId }
+ * Sin opción "Todas las categorías": cada opción es una categoría real.
+ * Al cambiar type se recargan solo las categorías de ese tipo.
  */
 async function _getDiscoverFilters(filters) {
   const opts = filters && typeof filters === 'object' ? filters : {};
-  // La UI usa la clave "type" del primer filtro
   const kind = resolveKind(opts.type || opts.kind || opts.filter || 'movie');
   const types = [
     { id: 'movie', label: 'Películas' },
@@ -645,12 +649,12 @@ async function _getDiscoverFilters(filters) {
   for (const k of kinds) {
     rowsByKind.push(await categoryRows(k).catch(() => []));
   }
-  const options = [{ id: 'all', label: 'Todas las categorías' }];
-  const seen = new Set(['all']);
+  const options = [];
+  const seen = new Set();
   for (let i = 0; i < kinds.length; i++) {
     for (const row of rowsByKind[i]) {
       const id = String(row.id || '');
-      // Solo columnId numérico (getShelveData lo exige)
+      // Solo columnId numérico real (nada de "all")
       if (!/^\d+$/.test(id) || seen.has(id)) continue;
       seen.add(id);
       categoryKinds.set(id, kinds[i]);
@@ -665,6 +669,22 @@ async function _getDiscoverFilters(filters) {
         columnId: id,
         columnCode: String(row.code || ''),
         type: kinds[i] === 'movies' ? 'movie' : kinds[i]
+      });
+    }
+  }
+  // Si no hubo columnas, al menos la raíz del tipo como única categoría
+  if (!options.length) {
+    for (const k of kinds) {
+      const rootId = ROOT[k] || ROOT.movies;
+      if (seen.has(rootId)) continue;
+      seen.add(rootId);
+      categoryKinds.set(rootId, k);
+      options.push({
+        id: rootId,
+        label: kindLabel(k),
+        columnId: rootId,
+        columnCode: HOME[k] || '',
+        type: k === 'movies' ? 'movie' : k
       });
     }
   }
@@ -746,7 +766,7 @@ async function fetchShelvePage(columnId, forcedType, page, pageSize) {
 
 async function _getDiscover(options) {
   const opts = options && typeof options === 'object' ? options : {};
-  // UI: { page, type, category } en el mismo objeto
+  // UI: { page, type, category } — category debe ser un columnId de UNA categoría
   const kind = resolveKind(opts.type || opts.kind || 'movie');
   const page = Math.max(1, parseInt(opts.page, 10) || 1);
   const pageSize = Math.min(30, Math.max(8, parseInt(opts.pageSize, 10) || 20));
@@ -759,6 +779,8 @@ async function _getDiscover(options) {
     opts.filter ||
     ''
   ).trim();
+
+  // Ignorar valores que no son categoría real
   if (
     !selected ||
     selected === 'all' ||
@@ -768,11 +790,10 @@ async function _getDiscover(options) {
     selected === 'type' ||
     selected === 'movie' ||
     selected === 'series' ||
-    selected === 'anime'
+    selected === 'anime' ||
+    selected === 'movies'
   ) {
-    // Evitar que un valor de "type" se confunda con categoría
-    if (['movie', 'series', 'anime', 'type'].includes(selected)) selected = '';
-    else if (selected === 'all' || selected === 'Todas las categorías' || selected === 'undefined' || selected === 'null') selected = '';
+    selected = '';
   }
 
   // Resolver código/nombre → columnId numérico
@@ -780,7 +801,7 @@ async function _getDiscover(options) {
     const mapped = categoryKinds.get(selected);
     const searchKinds = mapped
       ? [mapped]
-      : (kind === 'all' ? ['movies', 'series', 'anime'] : [kind === 'movies' ? 'movies' : kind]);
+      : [kind === 'movies' ? 'movies' : kind === 'all' ? 'movies' : kind];
     for (const k of searchKinds) {
       const rows = await categoryRows(k).catch(() => []);
       const found = rows.find(r =>
@@ -796,14 +817,25 @@ async function _getDiscover(options) {
         break;
       }
     }
-    if (selected && !/^\d+$/.test(selected)) {
-      selected = '';
+    if (selected && !/^\d+$/.test(selected)) selected = '';
+  }
+
+  const forcedFromKind = kind === 'anime' ? 'anime' : kind === 'series' ? 'series' : 'movie';
+
+  // Si no hay categoría elegida (primer load), usar la primera categoría real del tipo
+  if (!selected) {
+    try {
+      const rows = await categoryRows(kind === 'movies' ? 'movies' : kind === 'all' ? 'movies' : kind).catch(() => []);
+      const first = rows.find(r => /^\d+$/.test(String(r.id || '')));
+      if (first) selected = String(first.id);
+    } catch (_) {}
+    if (!selected) {
+      const rootKey = kind === 'anime' ? 'anime' : kind === 'series' ? 'series' : 'movies';
+      selected = ROOT[rootKey] || ROOT.movies;
     }
   }
 
-  const forcedFromKind = kind === 'anime' ? 'anime' : kind === 'series' ? 'series' : kind === 'movies' ? 'movie' : undefined;
-
-  // Categoría concreta
+  // SOLO contenido de esa categoría (nunca mezclar con otras ni con "todo")
   if (selected && /^\d+$/.test(selected)) {
     const mapped = categoryKinds.get(selected);
     const inferred = mapped || (kind === 'all' ? '' : kind);
@@ -812,40 +844,11 @@ async function _getDiscover(options) {
       : inferred === 'movies' || inferred === 'movie' ? 'movie'
       : forcedFromKind;
     const pageResult = await fetchShelvePage(selected, forcedType, page, pageSize);
-    if (pageResult.items.length || pageResult.total) return pageResult;
-    // Último recurso: no devolver vacío silencioso sin intentar raíz del tipo
+    // Devolver tal cual: solo esa estantería, aunque venga vacía
+    return pageResult;
   }
 
-  // "Todas las categorías" / sin filtro → estantería raíz del tipo (paginada en el servidor)
-  if (kind === 'all') {
-    // Mezcla ligera: solo página actual desde cada raíz, sin cargar catálogos enteros
-    const keys = ['movies', 'series', 'anime'];
-    const chunks = await Promise.all(keys.map(async k => {
-      const rootId = ROOT[k];
-      const ft = k === 'series' ? 'series' : k === 'anime' ? 'anime' : 'movie';
-      return fetchShelvePage(rootId, ft, page, Math.ceil(pageSize / 3));
-    }));
-    const items = unique(chunks.flatMap(c => c.items));
-    const hasMore = chunks.some(c => c.hasMore);
-    return { items: items.slice(0, pageSize), page, hasMore, total: items.length };
-  }
-
-  const rootKey = kind === 'anime' ? 'anime' : kind === 'series' ? 'series' : 'movies';
-  const rootId = ROOT[rootKey] || ROOT.movies;
-  const forcedType = rootKey === 'series' ? 'series' : rootKey === 'anime' ? 'anime' : 'movie';
-  const rootPage = await fetchShelvePage(rootId, forcedType, page, pageSize);
-  if (rootPage.items.length || rootPage.hasMore) return rootPage;
-
-  // Fallback: home ya cacheado (pocos ítems), paginado en cliente solo como último recurso
-  const rows = await homeRows(rootKey).catch(() => []);
-  const all = unique(rows.flatMap(r => r.items || []));
-  const start = (page - 1) * pageSize;
-  return {
-    items: all.slice(start, start + pageSize),
-    page,
-    hasMore: start + pageSize < all.length,
-    total: all.length
-  };
+  return { items: [], page, hasMore: false, total: 0 };
 }
 
 async function search(query, options) {
@@ -929,20 +932,28 @@ function unwrapDetail(response) {
   return data && typeof data === 'object' ? data : {};
 }
 
-function episodeRows(data, seriesId, defaultSeason) {
+function episodeRows(data, seriesId, defaultSeason, seasonPortalId) {
   const raw = listFrom(data, ['simpleProgramList', 'episodeList', 'episodes', 'programList', 'movieList', 'assetList']);
+  const seasonPortal = String(seasonPortalId || seriesId || '');
   return raw.map((ep, j) => {
     const e = normalizeItem(ep);
     const number = Number(ep.seriesNumber || ep.episodeNum || ep.episodeNo || ep.episode || ep.number || j + 1) || j + 1;
     const id = String(ep.contentId || ep.id || ep.movieId || ep.assetId || '');
     if (!id) return null;
-    const season = Number(ep.seasonNumber || ep.seasonNum || ep.season || defaultSeason || 1) || 1;
-    // Indexar para getStreams (cualquier temporada)
+    // Forzar la temporada que estamos cargando (no la que diga el portal a veces mal)
+    const season = Number(defaultSeason || ep.seasonNumber || ep.seasonNum || ep.season || 1) || 1;
     if (seriesId) {
       episodeContentIds.set(`${seriesId}:${season}:${number}`, id);
       episodeParent.set(id, String(seriesId));
+      if (seasonPortal) {
+        episodeSeasonId.set(id, seasonPortal);
+        seasonContentIds.set(`${seriesId}:${season}`, seasonPortal);
+        episodeContentIds.set(`${seasonPortal}:${season}:${number}`, id);
+      }
       limitMap(episodeContentIds, MAX_MAP);
       limitMap(episodeParent, MAX_MAP);
+      limitMap(episodeSeasonId, MAX_MAP);
+      limitMap(seasonContentIds, MAX_MAP);
     }
     return {
       number,
@@ -956,7 +967,8 @@ function episodeRows(data, seriesId, defaultSeason) {
       still: String(ep.poster || ep.posterUrl || e.poster || e.backdrop || ''),
       poster: String(ep.poster || ep.posterUrl || e.poster || ''),
       season,
-      seriesContentId: String(ep.seriesContentId || seriesId || '')
+      seriesContentId: String(seriesId || ''),
+      seasonContentId: seasonPortal
     };
   }).filter(Boolean);
 }
@@ -1022,7 +1034,9 @@ async function _getMeta(id, options) {
     }
     const detailTitleForSeason = String(data.name || data.viewPoint || data.alias || data.title || '');
     const defaultSeason = Number(data.seasonNumber || data.season || parseSeasonFromName(detailTitleForSeason) || 1) || 1;
-    const simple = episodeRows(data, contentId, defaultSeason);
+    // Esta ficha puede ser YA una temporada concreta: su contentId es el de esa temporada
+    const simple = episodeRows(data, contentId, defaultSeason, contentId);
+    seasonContentIds.set(`${contentId}:${defaultSeason}`, contentId);
     const ptype = String(data.programType || data.contentType || data.type || '').toLowerCase();
     const isSeries = ['teleplay', 'series', 'variety', '0', 'tv'].includes(ptype) || fetchedType === '0' || simple.length > 1 || Array.isArray(data.sameSeasonSeriesList);
     const type = isSeries ? (knownType === 'anime' ? 'anime' : 'series') : 'movie';
@@ -1059,8 +1073,11 @@ async function _getMeta(id, options) {
         season: number,
         name: `Temporada ${number}`,
         title: `Temporada ${number}`,
-        episodes: episodes.sort((a, b) => a.number - b.number)
+        episodes: episodes.sort((a, b) => a.number - b.number),
+        // contentId de esta temporada en el portal (= ficha actual si es su temporada)
+        contentId: contentId
       });
+      seasonContentIds.set(`${contentId}:${number}`, contentId);
     }
 
     // Cada temporada suele ser otro contentId (sameSeasonSeriesList)
@@ -1103,20 +1120,30 @@ async function _getMeta(id, options) {
           });
           const sd = unwrapDetail(sr);
           const seasonNum = link.number || Number(sd.seasonNumber || sd.season || parseSeasonFromName(link.name) || seasons.length + 1) || 1;
-          // Forzar season en cada episodio = seasonNum (aunque el portal diga otra cosa)
-          let eps = episodeRows(sd, item.id, seasonNum);
-          eps = eps.map(ep => Object.assign({}, ep, { season: seasonNum, seriesContentId: item.id }));
-          episodeRows(sd, link.id, seasonNum);
-          // Indexar explícito T-N bajo el id de la ficha abierta
+          // Episodios de ESTA temporada: indexados bajo item.id y bajo link.id (contentId de la temporada)
+          let eps = episodeRows(sd, item.id, seasonNum, link.id);
+          eps = eps.map(ep => Object.assign({}, ep, {
+            season: seasonNum,
+            seriesContentId: item.id,
+            seasonContentId: link.id
+          }));
+          seasonContentIds.set(`${item.id}:${seasonNum}`, link.id);
+          seasonContentIds.set(`${link.id}:${seasonNum}`, link.id);
           for (const ep of eps) {
-            episodeContentIds.set(`${item.id}:${seasonNum}:${Number(ep.number)}`, String(ep.id));
-            episodeContentIds.set(`${link.id}:${seasonNum}:${Number(ep.number)}`, String(ep.id));
-            episodeParent.set(String(ep.id), String(item.id));
+            const eid = String(ep.id);
+            episodeContentIds.set(`${item.id}:${seasonNum}:${Number(ep.number)}`, eid);
+            episodeContentIds.set(`${link.id}:${seasonNum}:${Number(ep.number)}`, eid);
+            episodeParent.set(eid, String(item.id));
+            episodeSeasonId.set(eid, link.id);
           }
           limitMap(episodeContentIds, MAX_MAP);
+          limitMap(seasonContentIds, MAX_MAP);
           const existing = seasons.find(x => x.number === seasonNum);
           if (existing) {
-            if (!existing.episodes.length) existing.episodes = eps;
+            if (!existing.episodes.length) {
+              existing.episodes = eps;
+              existing.contentId = link.id;
+            }
           } else {
             seasons.push({
               number: seasonNum,
@@ -1288,56 +1315,78 @@ function extractSubtitles(baseUrl, ...sources) {
   return out;
 }
 
-async function resolveEpisodePlayableId(seriesContentId, season, episode) {
+/** Devuelve { playableId, seasonPortalId } para el capítulo pedido */
+async function resolveEpisodePlayable(seriesContentId, season, episode) {
   const sn = Number(season || 1) || 1;
   const en = Number(episode || 1) || 1;
-  const candidates = [seriesContentId];
-  // También probar si el id que mandó la app es de otra temporada
-  for (const [k, v] of episodeContentIds) {
-    if (String(v) === String(seriesContentId) || k.startsWith(seriesContentId + ':')) {
-      const parent = k.split(':')[0];
-      if (parent && !candidates.includes(parent)) candidates.push(parent);
+
+  const tryKeys = (parent) => {
+    const pid = episodeContentIds.get(`${parent}:${sn}:${en}`);
+    if (!pid) return null;
+    const seasonPortalId = episodeSeasonId.get(pid) ||
+      seasonContentIds.get(`${parent}:${sn}`) ||
+      parent;
+    return { playableId: pid, seasonPortalId: String(seasonPortalId) };
+  };
+
+  let hit = tryKeys(seriesContentId);
+  if (hit) return hit;
+
+  // Buscar otros padres indexados
+  for (const key of episodeContentIds.keys()) {
+    if (!key.endsWith(`:${sn}:${en}`)) continue;
+    const parent = key.split(':')[0];
+    hit = tryKeys(parent);
+    if (hit) {
+      // Alias bajo el id que mandó la app
+      episodeContentIds.set(`${seriesContentId}:${sn}:${en}`, hit.playableId);
+      if (hit.seasonPortalId) {
+        seasonContentIds.set(`${seriesContentId}:${sn}`, hit.seasonPortalId);
+        episodeSeasonId.set(hit.playableId, hit.seasonPortalId);
+      }
+      return hit;
     }
-  }
-  for (const parent of candidates) {
-    const key = `${parent}:${sn}:${en}`;
-    const hit = episodeContentIds.get(key);
-    if (hit) return hit;
   }
 
   try {
-    const meta = await getMeta(seriesContentId, { type: 'series' });
-    for (const parent of [seriesContentId, meta && meta.id, meta && meta.contentId].filter(Boolean)) {
-      const key = `${parent}:${sn}:${en}`;
-      const hit = episodeContentIds.get(key);
-      if (hit) return hit;
-    }
+    // Bypassear caché pública si hace falta datos frescos de otra temporada
+    const meta = await _getMeta(seriesContentId, { type: 'series' });
+    hit = tryKeys(seriesContentId) || tryKeys(meta && meta.id) || tryKeys(meta && meta.contentId);
+    if (hit) return hit;
+
     if (meta && Array.isArray(meta.seasons)) {
-      // Preferir temporada pedida; si es T1 y solo hay datos en sibling, ya están indexados
       let foundSeason = meta.seasons.find(x => Number(x.number) === sn);
-      if (!foundSeason && sn === 1) {
-        foundSeason = meta.seasons.find(x => Number(x.number) === 1) || meta.seasons[0];
-      }
       if (foundSeason && Array.isArray(foundSeason.episodes)) {
-        const foundEp = foundSeason.episodes.find(x => Number(x.number) === en) ||
-          foundSeason.episodes.find(x => Number(x.episode) === en);
+        const foundEp = foundSeason.episodes.find(x => Number(x.number) === en || Number(x.episode) === en);
         if (foundEp && (foundEp.id || foundEp.contentId)) {
           const playableId = String(foundEp.id || foundEp.contentId);
+          const seasonPortalId = String(
+            foundSeason.contentId ||
+            foundEp.seasonContentId ||
+            seasonContentIds.get(`${seriesContentId}:${sn}`) ||
+            seriesContentId
+          );
           episodeContentIds.set(`${seriesContentId}:${sn}:${en}`, playableId);
-          // Alias: si la app abrió desde otra temporada, también indexar
-          if (meta.id && String(meta.id) !== String(seriesContentId)) {
-            episodeContentIds.set(`${meta.id}:${sn}:${en}`, playableId);
-          }
           episodeParent.set(playableId, String(seriesContentId));
-          limitMap(episodeContentIds, MAX_MAP);
-          return playableId;
+          episodeSeasonId.set(playableId, seasonPortalId);
+          seasonContentIds.set(`${seriesContentId}:${sn}`, seasonPortalId);
+          return { playableId, seasonPortalId };
         }
       }
-      // Cargar sibling de la temporada pedida bajo demanda
-      const sibling = (meta.seasonSiblings || []).find(s => {
+
+      // Cargar la temporada pedida por sibling bajo demanda
+      let sibling = (meta.seasonSiblings || []).find(s => {
         const n = Number(s.seasonNumber || s.season || parseSeasonFromName(s.name || s.title || '') || 0);
         return n === sn;
-      }) || (sn === 1 ? (meta.seasonSiblings || [])[0] : null);
+      });
+      // Si no hay número, usar el de seasons[contentId]
+      if (!sibling && foundSeason && foundSeason.contentId) {
+        sibling = { contentId: foundSeason.contentId, id: foundSeason.contentId, seasonNumber: sn };
+      }
+      if (!sibling) {
+        const byIdx = (meta.seasonSiblings || [])[sn - 1];
+        if (byIdx) sibling = byIdx;
+      }
       if (sibling) {
         const sid = String(sibling.contentId || sibling.id || '');
         if (sid) {
@@ -1350,26 +1399,21 @@ async function resolveEpisodePlayableId(seriesContentId, season, episode) {
               macAddr: FIXED_MAC
             });
             const sd = unwrapDetail(sr);
-            const eps = episodeRows(sd, seriesContentId, sn);
-            episodeRows(sd, sid, sn);
-            // Forzar mapeo T1 si el portal no manda seasonNumber
-            if (sn === 1 && eps.length) {
-              for (const ep of eps) {
-                episodeContentIds.set(`${seriesContentId}:1:${Number(ep.number)}`, String(ep.id));
-                episodeParent.set(String(ep.id), String(seriesContentId));
-              }
-            }
-            const key = `${seriesContentId}:${sn}:${en}`;
-            const playableId = episodeContentIds.get(key) || '';
-            if (playableId) return playableId;
+            const eps = episodeRows(sd, seriesContentId, sn, sid);
             const byNum = eps.find(e => Number(e.number) === en);
-            if (byNum) return String(byNum.id);
+            if (byNum) {
+              return {
+                playableId: String(byNum.id),
+                seasonPortalId: sid
+              };
+            }
           } catch (_) {}
         }
       }
     }
   } catch (_) {}
-  return '';
+
+  return { playableId: '', seasonPortalId: '' };
 }
 
 async function _getStreams(id, type, season, episode) {
@@ -1380,21 +1424,21 @@ async function _getStreams(id, type, season, episode) {
   const isSeries = ['series', 'anime', 'tv', 'teleplay', '0'].includes(itemTypeHint);
 
   let playableId = parentId;
+  // Magis espera el contentId de la TEMPORADA (no solo el de la serie genérica)
   let seriesContentId = '';
 
   if (isSeries) {
-    seriesContentId = String((id && id.seriesContentId) || episodeParent.get(parentId) || parentId);
-    // Si el host pasó el contentId del episodio directo, usarlo
-    if (episodeParent.has(parentId) || (season == null && episode == null && itemKinds.get(parentId) !== 'series')) {
-      // parentId podría ser ya el episodio
-      if (episodeContentIds.size && [...episodeContentIds.values()].includes(parentId)) {
-        playableId = parentId;
-        seriesContentId = episodeParent.get(parentId) || seriesContentId;
-      } else {
-        playableId = await resolveEpisodePlayableId(seriesContentId, season, episode);
-      }
+    const rootId = String((id && id.seriesContentId) || episodeParent.get(parentId) || parentId);
+    // ¿Ya es un contentId de episodio?
+    if (episodeSeasonId.has(parentId) || [...episodeContentIds.values()].includes(parentId)) {
+      playableId = parentId;
+      seriesContentId = episodeSeasonId.get(parentId) || seasonContentIds.get(`${rootId}:${Number(season || 1)}`) || rootId;
     } else {
-      playableId = await resolveEpisodePlayableId(seriesContentId, season, episode);
+      const resolved = await resolveEpisodePlayable(rootId, season, episode);
+      playableId = resolved.playableId;
+      seriesContentId = resolved.seasonPortalId ||
+        seasonContentIds.get(`${rootId}:${Number(season || 1)}`) ||
+        rootId;
     }
     if (!playableId) return [];
   }
