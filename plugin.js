@@ -4,12 +4,14 @@
  *  - Episodios de otras temporadas: resuelve contentId real del capítulo
  *  - Subtítulos: extrae todos los tracks del play response para el player
  *
- * Perf (Home / Buscar / Descubrir) — sin cambiar la extracción de datos Magis:
- *  - Home: homeRows de movies/series/anime en paralelo
- *  - Descubrir: ROOT directo si no hay categoría; menos beans getShelveData;
- *    pageSize bajo en filtros; posters (imageStyle poster) no banner
- *  - Caché TTL un poco más larga en home/discover
- *  - TMDB opcional (config.tmdbApiKey): solo stills de capítulos ya listados por Magis
+ * Perf (Home / Buscar / Descubrir) — misma fuente Magis, menos jank:
+ *  - Rate gap ~100 ms (antes 300): menos cola artificial entre portal calls
+ *  - Crypto: DES key + config cacheados (no parse Hex ni config() en cada request)
+ *  - Home: solo getHome → getNextColumns; sin getShelveData en cold path
+ *  - Home/Discover/Filters: TTL pública más larga + inFlight compartido
+ *  - Descubrir: ROOT directo sin categoría; un solo bean getShelveData
+ *  - pageSize bajo en filtros; posters verticales en Discover
+ *  - TMDB opcional: solo stills de capítulos ya listados por Magis
  */
 'use strict';
 
@@ -32,13 +34,26 @@ const FIXED_MAC = '02:00:00:00:00:00';
 const HOME = { movies: 'masnew_movies', series: 'masnew_series', anime: 'masnew_anime', featured: 'masnew_featured' };
 const ROOT = { movies: '76263', series: '76235', anime: '76209' };
 
+// Gap mínimo entre POSTs al portal (más bajo = menos espera en Home frío).
+const RATE_GAP_MS = 60;
+// Fallar rápido si el host no responde → pasar a fallback (series/anime).
+const PORTAL_TIMEOUT_MS = 4000;
+
 let session = null;
 let sessionPromise = null;
 let preferredHost = null;
 let lastCallAt = 0;
 let rateQueue = Promise.resolve();
 
-const MAX_CACHE = 120;
+// Config / crypto cacheados (evita Object.assign + Hex.parse en cada encrypt/decrypt)
+let _cfgCache = null;
+let _cfgCacheAt = 0;
+const CFG_CACHE_MS = 30e3;
+let _desKey = null;
+let _desKeyHex = '';
+let _C = null;
+
+const MAX_CACHE = 160;
 const MAX_MAP = 500;
 
 const responseCache = new Map();
@@ -61,13 +76,13 @@ const contentImdbIds = new Map();
 const introdbCache = new Map();
 
 const CACHE_TTL = {
-  getHome: 8 * 60e3,
-  getNextColumns: 8 * 60e3,
-  'v3/getShelveData': 3 * 60e3,
-  'v3/getRecommends': 8 * 60e3,
-  'v3/searchByName': 30e3,
-  'v4/getItemData': 6 * 60e3,
-  'v14/getSlbInfo': 8 * 60e3
+  getHome: 10 * 60e3,
+  getNextColumns: 10 * 60e3,
+  'v3/getShelveData': 4 * 60e3,
+  'v3/getRecommends': 10 * 60e3,
+  'v3/searchByName': 45e3,
+  'v4/getItemData': 8 * 60e3,
+  'v14/getSlbInfo': 12 * 60e3
 };
 
 function limitMap(map, max) {
@@ -114,7 +129,7 @@ async function rateTurn() {
   rateQueue = new Promise(resolve => { release = resolve; });
   await previous;
   try {
-    const wait = Math.max(0, 300 - (Date.now() - lastCallAt));
+    const wait = Math.max(0, RATE_GAP_MS - (Date.now() - lastCallAt));
     if (wait) await new Promise(r => setTimeout(r, wait));
     lastCallAt = Date.now();
   } finally {
@@ -123,6 +138,8 @@ async function rateTurn() {
 }
 
 function config() {
+  const now = Date.now();
+  if (_cfgCache && now - _cfgCacheAt < CFG_CACHE_MS) return _cfgCache;
   let supplied = {};
   try {
     const all = globalThis.__nuvioConfig || {};
@@ -131,20 +148,32 @@ function config() {
   const c = Object.assign({}, DEFAULTS, supplied);
   c.hosts = String(c.hosts || DEFAULTS.hosts).split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
   c.scheme = String(c.scheme || 'https').replace(':', '');
+  _cfgCache = c;
+  _cfgCacheAt = now;
   return c;
 }
 
 function cryptoJS() {
+  if (_C) return _C;
   if (typeof CryptoJS === 'undefined' || !CryptoJS.TripleDES) {
     throw new Error('CryptoJS no está disponible en el runtime');
   }
-  return CryptoJS;
+  _C = CryptoJS;
+  return _C;
+}
+
+function desKey() {
+  const C = cryptoJS();
+  const hex = config().desKeyHex;
+  if (_desKey && _desKeyHex === hex) return _desKey;
+  _desKey = C.enc.Hex.parse(hex);
+  _desKeyHex = hex;
+  return _desKey;
 }
 
 function encryptBody(value) {
-  const c = config(), C = cryptoJS();
-  const key = C.enc.Hex.parse(c.desKeyHex);
-  const encrypted = C.TripleDES.encrypt(String(value), key, {
+  const C = cryptoJS();
+  const encrypted = C.TripleDES.encrypt(String(value), desKey(), {
     mode: C.mode.ECB,
     padding: C.pad.Pkcs7
   });
@@ -156,7 +185,7 @@ function decryptBlob(wire) {
   const C = cryptoJS();
   const b64 = C.enc.Utf8.stringify(C.enc.Hex.parse(String(wire)));
   const params = C.lib.CipherParams.create({ ciphertext: C.enc.Base64.parse(b64) });
-  return C.TripleDES.decrypt(params, C.enc.Hex.parse(config().desKeyHex), {
+  return C.TripleDES.decrypt(params, desKey(), {
     mode: C.mode.ECB,
     padding: C.pad.Pkcs7
   }).toString(C.enc.Utf8);
@@ -248,7 +277,7 @@ async function portal(path, bean, baseFields = true) {
         body: wire
       };
       if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
-        opts.signal = AbortSignal.timeout(6500);
+        opts.signal = AbortSignal.timeout(PORTAL_TIMEOUT_MS);
       }
       const response = await fetch(`${c.scheme}://${host}/api/portalCore/${path}`, opts);
       if (!response.ok) {
@@ -475,6 +504,43 @@ function unique(items) {
   });
 }
 
+/** Ítem mínimo para listas (Home / Descubrir): id + título + imágenes + tipo para abrir ficha */
+function slimListItem(it, opts) {
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const withBackdrop = o.withBackdrop !== false;
+  const id = String(it.contentId || it.id || '').trim();
+  const type = it.type === 'anime' || it.media_type === 'anime'
+    ? 'anime'
+    : (it.type === 'series' || it.media_type === 'series' || it.programType === 'series' || it.programType === 'teleplay')
+      ? 'series'
+      : (it.type === 'movie' || it.media_type === 'movie' ? 'movie' : (itemType(it) || 'movie'));
+  const title = String(it.title || it.name || id || 'Sin título');
+  const poster = String(it.poster || it.image || '').trim();
+  const backdrop = String(it.backdrop || it.background || poster).trim();
+  const out = {
+    id,
+    contentId: id,
+    title,
+    name: title,
+    type,
+    media_type: type,
+    programType: type === 'series' ? 'series' : type === 'anime' ? 'anime' : 'movie',
+    poster,
+    image: poster || backdrop
+  };
+  if (withBackdrop) {
+    out.backdrop = backdrop || poster;
+    out.background = backdrop || poster;
+  }
+  if (it.year) out.year = it.year;
+  if (id) {
+    itemKinds.set(id, type);
+    limitMap(itemKinds, MAX_MAP);
+  }
+  return out;
+}
+
+
 function categoryKindsFromRows(rows, kind) {
   for (const row of rows) {
     if (row.id) {
@@ -526,40 +592,65 @@ async function homeRows(kind) {
   const code = HOME[kind] || HOME.movies;
   const forcedType = kind === 'series' ? 'series' : kind === 'anime' ? 'anime' : 'movie';
   return cached('homeRows:' + kind, CACHE_TTL.getHome, async () => {
-    // 1) getHome (rápido). Solo si timeout → no insistir en cadena larga.
+    // Orden pensado para series/anime (getHome a menudo vacío/timeout en esos kinds):
+    // 1) getNextColumns → filas + columnIds de categorías (como Kino)
+    // 2) getHome
+    // 3) ROOT getShelveData → al menos una fila con ítems
+    try {
+      const data = await api('getNextColumns', {
+        columnCode: code,
+        pageNum: 1,
+        pageSize: 10,
+        version: ''
+      });
+      const rows = normalizeRows(data, kindLabel(kind), forcedType);
+      if (rows.length) {
+        categoryKindsFromRows(rows, kind);
+        for (const row of rows) rememberCategoryRow(row, kind);
+        return trimHomeRows(rows);
+      }
+    } catch (_) {}
+
     try {
       const data = await api('getHome', { homePageCode: code, version: '' });
       const rows = normalizeRows(data, kindLabel(kind), forcedType);
       if (rows.length) {
         categoryKindsFromRows(rows, kind);
+        for (const row of rows) rememberCategoryRow(row, kind);
         return trimHomeRows(rows);
       }
-    } catch (e) {
-      if (timeoutError(e)) return [];
-    }
-    // 2) Un solo fallback ligero (pageSize 8). Sin tercer intento en cold path.
-    try {
-      const data = await api('getNextColumns', { columnCode: code, pageNum: 1, pageSize: 8, version: '' });
-      const rows = normalizeRows(data, kindLabel(kind), forcedType);
-      if (rows.length) {
-        categoryKindsFromRows(rows, kind);
-        return trimHomeRows(rows);
-      }
-    } catch (e) {
-      if (timeoutError(e)) return [];
-    }
-    // 3) Último recurso: una página de la raíz (solo si los anteriores no dieron filas)
+    } catch (_) {}
+
     try {
       const rootId = ROOT[kind] || ROOT.movies;
       const data = await api('v3/getShelveData', {
-        columnId: rootId,
+        columnId: Number(rootId) || rootId,
         columnType: '2',
         pageNum: 1,
         pageSize: HOME_MAX_ITEMS_PER_ROW,
         encryptVersion: 0
       });
-      const items = unique(flattenItems(data, forcedType)).slice(0, HOME_MAX_ITEMS_PER_ROW);
-      if (items.length) return [{ id: rootId, code, title: kindLabel(kind), name: kindLabel(kind), items }];
+      let items = [];
+      if (Array.isArray(data.assetList)) {
+        items = data.assetList
+          .filter(x => x && typeof x === 'object')
+          .map(x => normalizeItem(x, forcedType));
+      }
+      if (!items.length) items = flattenItems(data, forcedType);
+      items = unique(items).slice(0, HOME_MAX_ITEMS_PER_ROW);
+      if (items.length) {
+        const row = {
+          id: String(rootId),
+          code,
+          shelveId: String(rootId),
+          title: kindLabel(kind),
+          name: kindLabel(kind),
+          items
+        };
+        categoryKindsFromRows([row], kind);
+        rememberCategoryRow(row, kind);
+        return [row];
+      }
     } catch (_) {}
     return [];
   });
@@ -567,21 +658,23 @@ async function homeRows(kind) {
 
 async function featured() {
   return cached('featured-items', CACHE_TTL['v3/getRecommends'], async () => {
+    // Preferir ítems ya en caché de Home (0 red extra en cold path)
+    const fromCache = unique([
+      ...((responseCache.get('homeRows:movies')?.value) || []).flatMap(r => r.items || []),
+      ...((responseCache.get('homeRows:series')?.value) || []).flatMap(r => r.items || []),
+      ...((responseCache.get('homeRows:anime')?.value) || []).flatMap(r => r.items || [])
+    ]).slice(0, 10);
+    if (fromCache.length >= 4) return fromCache;
+
     try {
-      // Solo 3 bloques featured (antes 6) → menos red y menos ítems
+      // Solo 2 bloques featured → menos payload y menos crypto
       const data = await api('v3/getRecommends', {
-        recommendCodeArr: Array.from({ length: 3 }, (_, i) => `masnew_featured${String(i + 1).padStart(2, '0')}`)
+        recommendCodeArr: Array.from({ length: 2 }, (_, i) => `masnew_featured${String(i + 1).padStart(2, '0')}`)
       });
       const items = unique(flattenItems(data)).slice(0, 10);
       if (items.length) return items;
     } catch (_) {}
-    // Solo reutiliza caché ya cargada; no dispara homeRows extra
-    const cachedMovies = responseCache.get('homeRows:movies')?.value || [];
-    const cachedSeries = responseCache.get('homeRows:series')?.value || [];
-    return unique([
-      ...cachedMovies.flatMap(r => r.items || []),
-      ...cachedSeries.flatMap(r => r.items || [])
-    ]).slice(0, 10);
+    return fromCache;
   });
 }
 
@@ -618,25 +711,57 @@ async function _getNews() {
 }
 
 async function _getHome() {
-  // Paraleliza los 3 tipos (el rateQueue sigue serializando el portal).
-  // Misma forma de filas/ítems; menos tiempo de pared en cold start.
-  const kinds = ['movies', 'series', 'anime'];
-  const results = await Promise.all(kinds.map(k => homeRows(k).catch(() => [])));
-  const rows = [];
-  for (let i = 0; i < kinds.length; i++) {
-    const kind = kinds[i];
-    for (const row of results[i] || []) {
-      rows.push(Object.assign({}, row, {
-        type: 'row',
-        categoryType: kind === 'movies' ? 'movie' : kind,
-        category: row.title,
-        // Home sigue en banner horizontal
-        imageStyle: 'backdrop'
-      }));
+  // Home ligero: 1 hero (slider) + 3 filas ROOT (últimas películas / series / animación).
+  // Una sola página getShelveData por kind (no todo el árbol de categorías).
+  const specs = [
+    { kind: 'movies', root: ROOT.movies, title: 'Últimas películas', type: 'movie', forced: 'movie' },
+    { kind: 'series', root: ROOT.series, title: 'Últimas series', type: 'series', forced: 'series' },
+    { kind: 'anime', root: ROOT.anime, title: 'Últimas animaciones', type: 'anime', forced: 'anime' }
+  ];
+  const pageSize = HOME_MAX_ITEMS_PER_ROW;
+
+  const pages = await Promise.all(specs.map(async (s) => {
+    try {
+      const page = await fetchShelvePage(s.root, s.forced, 1, pageSize);
+      const items = unique(page.items || [])
+        .slice(0, pageSize)
+        .map(it => slimListItem(it, { withBackdrop: true }));
+      return { spec: s, items };
+    } catch (_) {
+      return { spec: s, items: [] };
     }
+  }));
+
+  const rows = [];
+  const heroPool = [];
+
+  for (const { spec, items } of pages) {
+    if (!items.length) continue;
+    // Mezcla para el slider principal
+    heroPool.push(...items.slice(0, 4));
+    rows.push({
+      id: String(spec.root),
+      code: HOME[spec.kind] || '',
+      shelveId: String(spec.root),
+      title: spec.title,
+      name: spec.title,
+      type: 'row',
+      categoryType: spec.type,
+      category: spec.title,
+      imageStyle: 'poster',
+      items
+    });
   }
-  const news = await getNews().catch(() => []);
-  if (news.length) {
+
+  const limit = Math.max(1, Math.min(8, parseInt(config().newsLimit, 10) || 8));
+  const newsItems = unique(heroPool).slice(0, limit).map((it, i) =>
+    Object.assign({}, slimListItem(it, { withBackdrop: true }), {
+      section: 'novedades',
+      news: true,
+      newsRank: i + 1
+    })
+  );
+  if (newsItems.length) {
     rows.unshift({
       id: 'novedades',
       code: 'novedades',
@@ -644,7 +769,7 @@ async function _getHome() {
       name: 'Novedades',
       type: 'hero',
       imageStyle: 'backdrop',
-      items: news.slice(0, 8)
+      items: newsItems
     });
   }
   return rows;
@@ -668,12 +793,12 @@ async function getCatalog(catalogId, options) {
 function rememberCategoryRow(row, kind) {
   const key = String(row.id || row.code || '');
   if (!key) return;
+  // Solo metadatos de categoría (sin assetList completo) — el listado se pide al seleccionar
   const entry = {
-    items: unique(row.items || []),
+    items: [],
     kind,
     title: row.title || row.name || key,
     code: row.code || '',
-    // columnId numérico para paginar con getShelveData (lista completa)
     shelveId: row.shelveId || (/^\d+$/.test(key) ? key : '')
   };
   categoryItemsCache.set(key, entry);
@@ -685,21 +810,51 @@ function rememberCategoryRow(row, kind) {
 async function categoryRows(kind) {
   const code = HOME[kind] || HOME.movies;
   const forcedType = kind === 'series' ? 'series' : kind === 'anime' ? 'anime' : 'movie';
-  // Solo necesitamos nombres/IDs de categoría para filtros → pageSize bajo (menos payload/CPU)
-  try {
-    const data = await api('getNextColumns', { columnCode: code, pageNum: 1, pageSize: 12, version: '' });
-    const rows = normalizeRows(data, kindLabel(kind), forcedType);
-    const usable = rows.filter(r => (r.items && r.items.length) || r.id || r.code);
-    if (usable.length) {
-      categoryKindsFromRows(usable, kind);
-      for (const row of usable) rememberCategoryRow(row, kind);
-      return usable;
+  // Cache dedicada: filtros Discover no deben repetir getNextColumns al cambiar de página
+  return cached('categoryRows:' + kind, CACHE_TTL.getNextColumns, async () => {
+    // Reutilizar filas de Home solo si traen columnId numérico (sirve para filtros)
+    const homeHit = responseCache.get('homeRows:' + kind);
+    if (homeHit && homeHit.expires > Date.now() && Array.isArray(homeHit.value) && homeHit.value.length) {
+      const fromHome = homeHit.value.filter(r => {
+        const sid = String(r.shelveId || (/^\d+$/.test(String(r.id || '')) ? r.id : ''));
+        return sid && /^\d+$/.test(sid);
+      });
+      if (fromHome.length >= 2) {
+        categoryKindsFromRows(fromHome, kind);
+        for (const row of fromHome) rememberCategoryRow(row, kind);
+        return fromHome;
+      }
     }
-  } catch (_) {}
-  const rows = await homeRows(kind).catch(() => []);
-  categoryKindsFromRows(rows, kind);
-  for (const row of rows) rememberCategoryRow(row, kind);
-  return rows.filter(r => r.id || r.code || (r.items && r.items.length));
+    // Árbol completo de categorías (pageSize más alto → más opciones en el filtro)
+    try {
+      const data = await api('getNextColumns', {
+        columnCode: code,
+        pageNum: 1,
+        pageSize: 20,
+        version: ''
+      });
+      const rows = normalizeRows(data, kindLabel(kind), forcedType);
+      const usable = rows
+        .filter(r => r.id || r.code || r.shelveId || (r.items && r.items.length))
+        .map(r => ({
+          id: r.id,
+          code: r.code || '',
+          shelveId: r.shelveId || (/^\d+$/.test(String(r.id || '')) ? String(r.id) : ''),
+          title: r.title || r.name || '',
+          name: r.name || r.title || '',
+          items: []
+        }));
+      if (usable.length) {
+        categoryKindsFromRows(usable, kind);
+        for (const row of usable) rememberCategoryRow(row, kind);
+        return usable;
+      }
+    } catch (_) {}
+    const rows = await homeRows(kind).catch(() => []);
+    categoryKindsFromRows(rows, kind);
+    for (const row of rows) rememberCategoryRow(row, kind);
+    return rows.filter(r => r.id || r.code || (r.items && r.items.length));
+  });
 }
 
 /**
@@ -740,20 +895,19 @@ async function _getDiscoverFilters(filters) {
       });
     }
   }
-  if (!options.length) {
-    for (const k of kinds) {
-      const rootId = String(ROOT[k] || ROOT.movies);
-      if (seen.has(rootId)) continue;
-      seen.add(rootId);
-      categoryKinds.set(rootId, k);
-      options.push({
-        id: rootId,
-        label: kindLabel(k),
-        columnId: rootId,
-        columnCode: HOME[k] || '',
-        type: k === 'movies' ? 'movie' : k
-      });
-    }
+  // Siempre incluir ROOT de cada kind (Todos / raíz) para series y animación
+  for (const k of kinds) {
+    const rootId = String(ROOT[k] || ROOT.movies);
+    if (seen.has(rootId)) continue;
+    seen.add(rootId);
+    categoryKinds.set(rootId, k);
+    options.unshift({
+      id: rootId,
+      label: kindLabel(k) + ' (Todos)',
+      columnId: rootId,
+      columnCode: HOME[k] || '',
+      type: k === 'movies' ? 'movie' : k
+    });
   }
   return [
     { id: 'type', name: 'Tipo', label: 'Tipo', type: 'select', options: types },
@@ -773,11 +927,13 @@ async function fetchShelvePage(columnId, forcedType, page, pageSize) {
     return { items: [], page, hasMore: false, total: 0 };
   }
 
-  // Solo 2 beans (el portal acepta num o string). Evita 6 intentos rate-limited en frío.
+  // Un bean numérico primero (portal lo acepta). Solo si falla, string (1 extra rate-slot máximo).
   const beans = [
-    { columnId: idNum, columnType: '2', pageNum: page, pageSize, encryptVersion: 0 },
-    { columnId: idStr, columnType: '2', pageNum: page, pageSize, encryptVersion: 0 }
+    { columnId: idNum, columnType: '2', pageNum: page, pageSize, encryptVersion: 0 }
   ];
+  if (idStr !== String(idNum)) {
+    beans.push({ columnId: idStr, columnType: '2', pageNum: page, pageSize, encryptVersion: 0 });
+  }
 
   for (const bean of beans) {
     try {
@@ -791,19 +947,9 @@ async function fetchShelvePage(columnId, forcedType, page, pageSize) {
       if (!items.length) items = flattenItems(data, forcedType);
       items = unique(items).map(it => {
         const t = forcedType || itemType(it);
-        if (it.id) {
-          itemKinds.set(it.id, t);
-          limitMap(itemKinds, MAX_MAP);
-        }
-        // Descubrir: posters verticales (no banner)
-        const poster = it.poster || it.image || it.backdrop || '';
-        return Object.assign({}, it, {
-          type: t,
-          media_type: t,
-          poster,
-          image: poster,
-          imageStyle: 'poster'
-        });
+        const slim = slimListItem(Object.assign({}, it, { type: t }), { withBackdrop: false });
+        slim.imageStyle = 'poster';
+        return slim;
       });
       const totalRaw = data.assetListTotalSize ?? data.listTotalSize ?? data.totalSize ?? data.total ?? data.count;
       const pageItems = items.length > pageSize ? items.slice(0, pageSize) : items;
@@ -881,15 +1027,13 @@ async function _getDiscover(options) {
     shelveId = String(ROOT[rootKey] || ROOT.movies);
   }
 
+  // Solo la categoría seleccionada (o ROOT si no hay filtro). No precarga otras categorías.
   const pageResult = await fetchShelvePage(shelveId, forcedType, page, pageSize);
   if (pageResult.items.length || pageResult.hasMore) {
     pageResult.items = (pageResult.items || []).map(it => {
-      const poster = it.poster || it.image || '';
-      return Object.assign({}, it, {
-        poster,
-        image: poster,
-        imageStyle: 'poster'
-      });
+      const slim = slimListItem(it, { withBackdrop: false });
+      slim.imageStyle = 'poster';
+      return slim;
     });
     return pageResult;
   }
@@ -899,8 +1043,9 @@ async function _getDiscover(options) {
     const rootPage = await fetchShelvePage(rootId, forcedType, page, pageSize);
     if (rootPage.items.length || rootPage.hasMore) {
       rootPage.items = (rootPage.items || []).map(it => {
-        const poster = it.poster || it.image || '';
-        return Object.assign({}, it, { poster, image: poster, imageStyle: 'poster' });
+        const slim = slimListItem(it, { withBackdrop: false });
+        slim.imageStyle = 'poster';
+        return slim;
       });
       return rootPage;
     }
@@ -2011,16 +2156,17 @@ async function _getStreams(id, type, season, episode) {
 
 // ─── API pública ───────────────────────────────────────────────────────────
 async function getNews() {
-  return cached('public:getNews', 90e3, () => _getNews());
+  return cached('public:getNews', 3 * 60e3, () => _getNews());
 }
 async function getHome() {
-  return cached('public:getHome', 3 * 60e3, () => _getHome());
+  // TTL pública más larga: re-entrar a Home no debe rehacer portal + crypto
+  return cached('public:getHome', 6 * 60e3, () => _getHome());
 }
 async function getDiscoverFilters(filters) {
   const opts = filters && typeof filters === 'object' ? filters : {};
   const type = resolveKind(opts.type || opts.kind || 'movie');
   // Cache por tipo para que al cambiar Tipo se recarguen categorías
-  return cached('public:getDiscoverFilters:' + type, 8 * 60e3, () => _getDiscoverFilters(opts));
+  return cached('public:getDiscoverFilters:' + type, 12 * 60e3, () => _getDiscoverFilters(opts));
 }
 async function getDiscover(options) {
   const opts = options && typeof options === 'object' ? options : {};
@@ -2028,17 +2174,17 @@ async function getDiscover(options) {
   const type = resolveKind(opts.type || opts.kind || 'movie');
   const cat = String(opts.category || opts.columnId || opts.categoryId || opts.filter || 'all');
   const page = parseInt(opts.page, 10) || 1;
-  return cached(`public:getDiscover:${type}:${cat}:${page}`, 90e3, () => _getDiscover(opts));
+  return cached(`public:getDiscover:${type}:${cat}:${page}`, 3 * 60e3, () => _getDiscover(opts));
 }
 async function getMeta(id, options) {
   const keyId = id && typeof id === 'object' ? (id.contentId || id.id || id.assetId || id.programId || JSON.stringify(id)) : String(id || '');
   const opts = options && typeof options === 'object' ? options : (typeof options === 'string' ? { type: options } : {});
-  return cached('public:getMeta:' + String(keyId) + ':' + JSON.stringify(opts), 4 * 60e3, () => _getMeta(id, opts));
+  return cached('public:getMeta:' + String(keyId) + ':' + JSON.stringify(opts), 6 * 60e3, () => _getMeta(id, opts));
 }
 async function getStreams(id, type, season, episode) {
   const keyId = id && typeof id === 'object' ? (id.contentId || id.id || id.assetId || JSON.stringify(id)) : String(id || '');
   const key = ['public:getStreams', keyId, type || '', season || '', episode || ''].join(':');
-  return cached(key, 18e3, () => _getStreams(id, type, season, episode));
+  return cached(key, 25e3, () => _getStreams(id, type, season, episode));
 }
 
 module.exports = {
