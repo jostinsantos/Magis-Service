@@ -6,7 +6,7 @@
   "author": "XuperTV",
   "entry": "plugin.js",
   "main": "plugin.js",
-  "icon": "https://i.imgur.com/8Km9tLL.png",
+  "icon": "icon.png",
   "categories": ["movies", "series", "anime"],
   "capabilities": ["home", "discover", "search", "meta", "streams", "catalog"],
   "languages": ["Latino", "Español"],
