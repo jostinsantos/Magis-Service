@@ -1159,8 +1159,9 @@ async function resolveTmdbId(item, isTv) {
 async function enrichMetaLight(item) {
   if (!item || !config().tmdbEnrichMeta) return item;
   try {
+    // Nunca tratar movie como serie aunque tenga seasons vacío/stub
     const isSeries = item.type === 'series' || item.type === 'anime' ||
-      (Array.isArray(item.seasons) && item.seasons.length > 0);
+      (item.type !== 'movie' && Array.isArray(item.seasons) && item.seasons.length > 0);
 
     if (isSeries) {
       const tvId = await resolveTmdbId(item, true);
@@ -1241,36 +1242,40 @@ async function enrichMetaLight(item) {
         item.trailerUrl = trailer;
       }
 
-      // Temporadas ya cargadas en meta (todas las que traen episodios)
-      const seasons = (item.seasons || []).filter(s => s && Array.isArray(s.episodes) && s.episodes.length).slice(0, 8);
-      await Promise.all(seasons.map(async (s) => {
-        const sn = Number(s.number || s.season || 1) || 1;
-        const body = await tmdbGet('/tv/' + tvId + '/season/' + sn, {});
-        if (!body || !Array.isArray(body.episodes)) return;
-        const byNum = new Map();
-        for (const e of body.episodes) {
-          const n = Number(e.episode_number);
-          if (n) byNum.set(n, e);
-        }
-        for (const ep of s.episodes || []) {
-          const n = Number(ep.number || ep.episode || 0);
-          const te = byNum.get(n);
-          if (!te) continue;
-          const tmdbName = String(te.name || '').trim();
-          if (tmdbName) { ep.title = tmdbName; ep.name = tmdbName; }
-          const ov = String(te.overview || '').trim();
-          if (ov) { ep.overview = ov; ep.description = ov; }
-          const still = tmdbImg(te.still_path, 'w300');
-          if (still) { ep.still = still; ep.poster = still; ep.image = still; }
-          const rt = Number(te.runtime);
-          if (rt > 0 && rt < 1000) {
-            ep.runtime = rt;
-            ep.duration = rt * 60;
+      // Temporadas con episodios: enriquecer TODAS (sin tope 8) en serie
+      // para no saturar TMDB y que capítulos altos no se queden sin still/título
+      const seasons = (item.seasons || []).filter(s => s && Array.isArray(s.episodes) && s.episodes.length);
+      for (const s of seasons) {
+        try {
+          const sn = Number(s.number || s.season || 1) || 1;
+          const body = await tmdbGet('/tv/' + tvId + '/season/' + sn, {});
+          if (!body || !Array.isArray(body.episodes)) continue;
+          const byNum = new Map();
+          for (const e of body.episodes) {
+            const n = Number(e.episode_number);
+            if (n >= 0) byNum.set(n, e);
           }
-          if (te.air_date) { ep.airDate = String(te.air_date); ep.air_date = ep.airDate; }
-          if (te.vote_average != null) ep.rating = Math.round(Number(te.vote_average) * 10) / 10;
-        }
-      }));
+          for (const ep of s.episodes || []) {
+            const n = Number(ep.number || ep.episode || 0);
+            // match exacto; si no, intentar n+1 por si el portal indexa desde 0
+            const te = byNum.get(n) || (n === 0 ? byNum.get(1) : null);
+            if (!te) continue;
+            const tmdbName = String(te.name || '').trim();
+            if (tmdbName) { ep.title = tmdbName; ep.name = tmdbName; }
+            const ov = String(te.overview || '').trim();
+            if (ov) { ep.overview = ov; ep.description = ov; }
+            const still = tmdbImg(te.still_path, 'w300');
+            if (still) { ep.still = still; ep.poster = still; ep.image = still; }
+            const rt = Number(te.runtime);
+            if (rt > 0 && rt < 1000) {
+              ep.runtime = rt;
+              ep.duration = rt * 60;
+            }
+            if (te.air_date) { ep.airDate = String(te.air_date); ep.air_date = ep.airDate; }
+            if (te.vote_average != null) ep.rating = Math.round(Number(te.vote_average) * 10) / 10;
+          }
+        } catch (_) { /* siguiente temporada */ }
+      }
 
       if (Array.isArray(item.episodes) && item.seasons && item.seasons.length) {
         const curSn = Number((item.episodes[0] && item.episodes[0].season) || 1) || 1;
@@ -1522,13 +1527,21 @@ async function _getMeta(id, options) {
     seasonContentIds.set(`${contentId}:${defaultSeason}`, contentId);
 
     const ptype = String(data.programType || data.contentType || data.type || '').toLowerCase();
-    const isSeries = ['teleplay', 'series', 'variety', '0', 'tv'].includes(ptype) || fetchedType === '0' || simple.length > 1 || Array.isArray(data.sameSeasonSeriesList);
-    const type = isSeries ? (knownType === 'anime' ? 'anime' : 'series') : 'movie';
+    // sameSeasonSeriesList vacío [] NO debe marcar serie (Array.isArray([]) === true)
+    const hasSiblings = Array.isArray(data.sameSeasonSeriesList) && data.sameSeasonSeriesList.length > 0;
+    const isSeries = ['teleplay', 'series', 'variety', '0', 'tv'].includes(ptype) ||
+      fetchedType === '0' ||
+      simple.length > 1 ||
+      hasSiblings;
+    // Respetar tipo conocido de lista (movie) si no hay señales claras de serie
+    const type = (knownType === 'movie' && !hasSiblings && simple.length <= 1 && fetchedType !== '0')
+      ? 'movie'
+      : (isSeries ? (knownType === 'anime' ? 'anime' : 'series') : 'movie');
 
     const item = normalizeItem(merged, type);
     item.type = type;
     item.media_type = type;
-    item.programType = isSeries ? 'series' : 'movie';
+    item.programType = type === 'movie' ? 'movie' : 'series';
     item.id = String(data.contentId || data.id || contentId);
     item.contentId = item.id;
     item.title = String(data.name || data.viewPoint || data.alias || data.title || data.contentName || data.programName || item.title || contentId);
@@ -1632,9 +1645,21 @@ async function _getMeta(id, options) {
         if (!p.name) p.name = `Temporada ${p.number}`;
       }
 
-      // Cargar episodios de hermanas en paralelo (máx 8)
+      // Cargar episodios de hermanas de forma controlada (no todas a la vez)
+      // para respetar rate gap y que no fallen capítulos/temporadas altas.
+      // Si opts.season viene, priorizar esa; el resto se carga igual pero en serie de a 2.
       const maxSeasons = Math.min(40, Math.max(1, parseInt(config().maxSeasonsMeta, 10) || 30));
-      await Promise.all(pending.slice(0, maxSeasons).map(async (link) => {
+      const requestedSeason = Number(opts.season || 0) || 0;
+      let linksToLoad = pending.slice(0, maxSeasons);
+      if (requestedSeason > 0) {
+        linksToLoad = linksToLoad.slice().sort((a, b) => {
+          const da = Math.abs((a.number || 0) - requestedSeason);
+          const db = Math.abs((b.number || 0) - requestedSeason);
+          return da - db;
+        });
+      }
+
+      const loadSibling = async (link) => {
         try {
           const sr = await api('v4/getItemData', {
             contentId: link.id,
@@ -1644,7 +1669,6 @@ async function _getMeta(id, options) {
             macAddr: FIXED_MAC
           });
           const sd = unwrapDetail(sr);
-          // Preferir número del sibling; si el detalle trae uno claro y el link era auto, usar el del detalle
           let seasonNum = link.number;
           const fromDetail = seasonNumberOf(sd, 0);
           if (fromDetail > 0 && (link.known || !byNumber.has(fromDetail))) {
@@ -1668,7 +1692,6 @@ async function _getMeta(id, options) {
             episodeParent.set(eid, String(seriesRootId));
             episodeSeasonId.set(eid, link.id);
           }
-          // No pisar la temporada actual si coincide el número
           if (byNumber.has(seasonNum) && byNumber.get(seasonNum).current) return;
           byNumber.set(seasonNum, {
             number: seasonNum,
@@ -1694,7 +1717,14 @@ async function _getMeta(id, options) {
             });
           }
         }
-      }));
+      };
+
+      // Concurrencia 2 (progresivo / estable con rate gap 80ms)
+      const CONC = 2;
+      for (let i = 0; i < linksToLoad.length; i += CONC) {
+        const batch = linksToLoad.slice(i, i + CONC);
+        await Promise.all(batch.map(loadSibling));
+      }
 
       // Corregir orden/números con TMDB cuando hay duda (temporadas sin número conocido o desorden)
       try {
@@ -2167,7 +2197,112 @@ async function getNews() {
   });
 }
 
-async function getHome() {
+/**
+ * Home progresivo compatible con la app:
+ * - getHome({ structureOnly: true }) → filas sin items (esqueleto)
+ * - getHome({ rowId / catalogId / id, page }) → una fila / página de items
+ * - getHome() → home completo (legado)
+ */
+async function getHome(options) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const structureOnly = !!(opts.structureOnly || opts.lightweight);
+  const rowId = String(opts.rowId || opts.catalogId || opts.id || opts.columnId || '').trim();
+  const page = parseInt(opts.page, 10) || 1;
+
+  // 1) Esqueleto: filas vacías con id/shelveId para loadHomeRow
+  if (structureOnly && !rowId) {
+    return cached('public:getHome:structure', 10 * 60e3, async () => {
+      const full = await _getHome();
+      return (full || []).map(r => ({
+        id: String(r.id || r.shelveId || r.code || ''),
+        code: r.code || '',
+        shelveId: String(r.shelveId || ( /^\d+$/.test(String(r.id || '')) ? r.id : '') || ''),
+        catalogId: String(r.shelveId || r.id || r.code || ''),
+        title: r.title || r.name || '',
+        name: r.name || r.title || '',
+        type: r.type || 'row',
+        imageStyle: r.imageStyle || (r.type === 'hero' ? 'backdrop' : 'poster'),
+        categoryType: r.categoryType || '',
+        category: r.category || '',
+        items: []
+      }));
+    });
+  }
+
+  // 2) Una fila concreta (progresivo)
+  if (rowId) {
+    const cacheKey = `public:getHome:row:${rowId}:${page}`;
+    return cached(cacheKey, 5 * 60e3, async () => {
+      // Hero / novedades
+      if (rowId === 'novedades' || rowId === 'hero') {
+        const full = await _getHome();
+        const hero = (full || []).find(r => r.type === 'hero' || r.id === 'novedades');
+        const items = (hero && hero.items) || [];
+        return {
+          id: 'novedades',
+          title: 'Novedades',
+          name: 'Novedades',
+          type: 'hero',
+          imageStyle: 'backdrop',
+          items,
+          hasMore: false,
+          page
+        };
+      }
+
+      // Shelve numérico (ROOT movies/series/anime u otras columnas)
+      const forced =
+        rowId === String(ROOT.movies) || rowId === HOME.movies ? 'movie' :
+        rowId === String(ROOT.series) || rowId === HOME.series ? 'series' :
+        rowId === String(ROOT.anime) || rowId === HOME.anime ? 'anime' :
+        (categoryKinds.get(rowId) === 'series' ? 'series' :
+         categoryKinds.get(rowId) === 'anime' ? 'anime' : 'movie');
+
+      const pageSize = HOME_MAX_ITEMS_PER_ROW;
+      try {
+        const shelve = /^\d+$/.test(rowId) ? rowId : '';
+        if (shelve) {
+          const result = await fetchShelvePage(shelve, forced, page, pageSize);
+          const items = unique(result.items || []).map(it => slimListItem(it, { withBackdrop: true }));
+          const title =
+            forced === 'series' ? 'Últimas series' :
+            forced === 'anime' ? 'Últimas animaciones' : 'Últimas películas';
+          return {
+            id: shelve,
+            shelveId: shelve,
+            catalogId: shelve,
+            title,
+            name: title,
+            type: 'row',
+            imageStyle: 'poster',
+            categoryType: forced,
+            items,
+            hasMore: !!(result.hasMore || (items.length >= pageSize)),
+            page
+          };
+        }
+      } catch (_) {}
+
+      // Fallback: buscar en home completo
+      const full = await _getHome();
+      const match = (full || []).find(r =>
+        String(r.id) === rowId ||
+        String(r.shelveId) === rowId ||
+        String(r.code) === rowId ||
+        String(r.catalogId || '') === rowId
+      );
+      if (match) {
+        return Object.assign({}, match, {
+          items: match.items || [],
+          hasMore: false,
+          page
+        });
+      }
+      return { id: rowId, items: [], hasMore: false, page };
+    });
+  }
+
+  // 3) Legado: home completo
   return cached('public:getHome', 8 * 60e3, () => _getHome());
 }
 
@@ -2194,8 +2329,24 @@ async function getCatalogs() {
 }
 
 async function getCatalog(catalogId, options) {
-  const id = String(catalogId || '').toLowerCase();
+  const rawId = String(catalogId || '').trim();
+  const id = rawId.toLowerCase();
   const opts = options && typeof options === 'object' ? options : {};
+  const page = parseInt(opts.page, 10) || 1;
+  const pageSize = parseInt(opts.pageSize, 10) || HOME_MAX_ITEMS_PER_ROW;
+
+  // Shelve numérico (filas del home progresivo)
+  if (/^\d+$/.test(rawId)) {
+    const forced =
+      categoryKinds.get(rawId) === 'series' ? 'series' :
+      categoryKinds.get(rawId) === 'anime' ? 'anime' :
+      rawId === String(ROOT.series) ? 'series' :
+      rawId === String(ROOT.anime) ? 'anime' : 'movie';
+    const result = await fetchShelvePage(rawId, forced, page, pageSize);
+    const items = unique(result.items || []).map(it => slimListItem(it, { withBackdrop: true }));
+    return { items, hasMore: !!result.hasMore, page, total: result.total };
+  }
+
   const kind = id.includes('anime') || id.includes('anim') ? 'anime' : id.includes('series') ? 'series' : 'movies';
   return getDiscover(Object.assign({}, opts, { kind }));
 }
