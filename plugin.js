@@ -1166,18 +1166,22 @@ async function enrichMetaLight(item) {
       const tvId = await resolveTmdbId(item, true);
       if (!tvId) return item;
 
-      // detail + images en paralelo (2 llamadas, no external_ids salvo que haga falta imdb)
-      const [detail, images] = await Promise.all([
-        tmdbGet('/tv/' + tvId, {}),
-        tmdbGet('/tv/' + tvId + '/images', { include_image_language: 'es,en,null' })
+      // detail + images + videos en paralelo (credits/images vía append)
+      const [detail, images, videos] = await Promise.all([
+        tmdbGet('/tv/' + tvId, { append_to_response: 'credits,external_ids' }),
+        tmdbGet('/tv/' + tvId + '/images', { include_image_language: 'es,en,null' }),
+        tmdbGet('/tv/' + tvId + '/videos', { language: 'es-ES' })
       ]);
 
       let imdbId = String(
         (item.details && (item.details.keyWords || item.details.imdbId || item.details.imdb)) ||
         item.imdb || item.imdbId || ''
       ).trim();
+      if (!/^tt\d{7,}$/i.test(imdbId) && detail && detail.external_ids) {
+        const e = String(detail.external_ids.imdb_id || '').trim();
+        if (/^tt\d{7,}$/i.test(e)) imdbId = e;
+      }
       if (!/^tt\d{7,}$/i.test(imdbId) && detail) {
-        // external_ids solo si no tenemos imdb
         try {
           const ext = await tmdbGet('/tv/' + tvId + '/external_ids', {});
           const e = ext && String(ext.imdb_id || '').trim();
@@ -1195,19 +1199,46 @@ async function enrichMetaLight(item) {
       if (logo) { item.logo = logo; item.clearlogo = logo; }
       if (detail) {
         item.tmdbId = tvId;
-        if (!item.overview && detail.overview) {
+        item.tmdbType = 'tv';
+        if (detail.overview) {
           item.overview = String(detail.overview);
           item.description = item.overview;
         }
-        if (!item.backdrop && detail.backdrop_path) {
+        if (detail.backdrop_path) {
           item.backdrop = tmdbImg(detail.backdrop_path, 'w1280');
           item.background = item.backdrop;
         }
-        if ((!item.poster || !item.poster.length) && detail.poster_path) {
+        if (detail.poster_path) {
           item.poster = tmdbImg(detail.poster_path, 'w500');
           item.image = item.poster;
         }
         if (detail.name) item.tmdbTitle = String(detail.name);
+        if (detail.first_air_date && !item.year) {
+          item.year = String(detail.first_air_date).slice(0, 4);
+        }
+        if (detail.vote_average != null) {
+          item.rating = Math.round(Number(detail.vote_average) * 10) / 10;
+        }
+        // Cast (igual que la web)
+        const credits = detail.credits || {};
+        item.cast = tmdbCast(credits.cast || []);
+        // Director / creadores
+        item.director = tmdbDirector(credits.crew || [], true);
+        item.creators = tmdbCreators(detail.created_by || []);
+        // Runtime típico de episodio
+        const epRun = Array.isArray(detail.episode_run_time) && detail.episode_run_time.length
+          ? Number(detail.episode_run_time[0]) : 0;
+        if (epRun > 0) {
+          item.runtime = epRun;
+          item.duration = epRun * 60;
+        }
+      }
+
+      // Trailer
+      const trailer = pickTrailer(videos);
+      if (trailer) {
+        item.trailer = trailer;
+        item.trailerUrl = trailer;
       }
 
       // Temporadas ya cargadas en meta (todas las que traen episodios)
@@ -1232,8 +1263,12 @@ async function enrichMetaLight(item) {
           const still = tmdbImg(te.still_path, 'w300');
           if (still) { ep.still = still; ep.poster = still; ep.image = still; }
           const rt = Number(te.runtime);
-          if (rt > 0 && rt < 1000) { ep.runtime = rt; ep.duration = rt; }
+          if (rt > 0 && rt < 1000) {
+            ep.runtime = rt;
+            ep.duration = rt * 60;
+          }
           if (te.air_date) { ep.airDate = String(te.air_date); ep.air_date = ep.airDate; }
+          if (te.vote_average != null) ep.rating = Math.round(Number(te.vote_average) * 10) / 10;
         }
       }));
 
@@ -1243,18 +1278,23 @@ async function enrichMetaLight(item) {
         if (cur && cur.episodes && cur.episodes.length) item.episodes = cur.episodes;
       }
     } else {
-      // Película: logo + overview/poster (sin IntroDB)
+      // Película: logo + overview/poster + cast + director + trailer + duración
       const movieId = await resolveTmdbId(item, false);
       if (!movieId) return item;
-      const [detail, images] = await Promise.all([
-        tmdbGet('/movie/' + movieId, {}),
-        tmdbGet('/movie/' + movieId + '/images', { include_image_language: 'es,en,null' })
+      const [detail, images, videos] = await Promise.all([
+        tmdbGet('/movie/' + movieId, { append_to_response: 'credits,external_ids' }),
+        tmdbGet('/movie/' + movieId + '/images', { include_image_language: 'es,en,null' }),
+        tmdbGet('/movie/' + movieId + '/videos', { language: 'es-ES' })
       ]);
       let imdbId = String(
         (item.details && (item.details.keyWords || item.details.imdbId || item.details.imdb)) ||
         item.imdb || item.imdbId || ''
       ).trim();
-      if (!/^tt\d{7,}$/i.test(imdbId)) {
+      if (!/^tt\d{7,}$/i.test(imdbId) && detail && detail.external_ids) {
+        const e = String(detail.external_ids.imdb_id || '').trim();
+        if (/^tt\d{7,}$/i.test(e)) imdbId = e;
+      }
+      if (!/^tt\d{7,}$/i.test(imdbId) && detail) {
         try {
           const ext = await tmdbGet('/movie/' + movieId + '/external_ids', {});
           const e = ext && String(ext.imdb_id || '').trim();
@@ -1271,23 +1311,111 @@ async function enrichMetaLight(item) {
       if (logo) { item.logo = logo; item.clearlogo = logo; }
       if (detail) {
         item.tmdbId = movieId;
-        if (!item.overview && detail.overview) {
+        item.tmdbType = 'movie';
+        if (detail.overview) {
           item.overview = String(detail.overview);
           item.description = item.overview;
         }
-        if (!item.backdrop && detail.backdrop_path) {
+        if (detail.backdrop_path) {
           item.backdrop = tmdbImg(detail.backdrop_path, 'w1280');
           item.background = item.backdrop;
         }
-        if ((!item.poster || !item.poster.length) && detail.poster_path) {
+        if (detail.poster_path) {
           item.poster = tmdbImg(detail.poster_path, 'w500');
           item.image = item.poster;
         }
-        if (detail.runtime > 0) item.runtime = Number(detail.runtime);
+        if (detail.title) item.tmdbTitle = String(detail.title);
+        if (detail.release_date && !item.year) {
+          item.year = String(detail.release_date).slice(0, 4);
+        }
+        if (detail.runtime > 0) {
+          item.runtime = Number(detail.runtime);
+          item.duration = Number(detail.runtime) * 60;
+        }
+        if (detail.vote_average != null) {
+          item.rating = Math.round(Number(detail.vote_average) * 10) / 10;
+        }
+        const credits = detail.credits || {};
+        item.cast = tmdbCast(credits.cast || []);
+        item.director = tmdbDirector(credits.crew || [], false);
+      }
+      const trailer = pickTrailer(videos);
+      if (trailer) {
+        item.trailer = trailer;
+        item.trailerUrl = trailer;
       }
     }
   } catch (_) {}
   return item;
+}
+
+/** Cast estilo web Magis (máx 16) */
+function tmdbCast(cast) {
+  if (!Array.isArray(cast)) return [];
+  const out = [];
+  for (const c of cast.slice(0, 16)) {
+    if (!c || typeof c !== 'object') continue;
+    out.push({
+      id: Number(c.id) || 0,
+      name: String(c.name || ''),
+      character: String(c.character || ''),
+      profile: c.profile_path ? tmdbImg(c.profile_path, 'w185') : ''
+    });
+  }
+  return out;
+}
+
+/** Director (película) o showrunner/director principal (serie) */
+function tmdbDirector(crew, isTv) {
+  if (!Array.isArray(crew) || !crew.length) return '';
+  const jobs = isTv
+    ? ['Director', 'Series Director', 'Executive Producer']
+    : ['Director'];
+  for (const job of jobs) {
+    const hit = crew.find(c => c && String(c.job || '') === job && c.name);
+    if (hit) return String(hit.name);
+  }
+  // Fallback: primer Director en cualquier idioma
+  const dir = crew.find(c => c && /director/i.test(String(c.job || '')) && c.name);
+  return dir ? String(dir.name) : '';
+}
+
+function tmdbCreators(createdBy) {
+  if (!Array.isArray(createdBy)) return [];
+  return createdBy
+    .filter(c => c && c.name)
+    .slice(0, 6)
+    .map(c => ({
+      id: Number(c.id) || 0,
+      name: String(c.name || ''),
+      profile: c.profile_path ? tmdbImg(c.profile_path, 'w185') : ''
+    }));
+}
+
+/** Trailer YouTube preferente (oficial / trailer ES → EN) */
+function pickTrailer(videos) {
+  if (!videos || !Array.isArray(videos.results) || !videos.results.length) return '';
+  const list = videos.results.filter(v =>
+    v && v.site === 'YouTube' && v.key &&
+    (String(v.type || '').toLowerCase() === 'trailer' || String(v.type || '').toLowerCase() === 'teaser')
+  );
+  if (!list.length) {
+    const any = videos.results.find(v => v && v.site === 'YouTube' && v.key);
+    return any ? ('https://www.youtube.com/watch?v=' + any.key) : '';
+  }
+  const rank = (v) => {
+    const t = String(v.type || '').toLowerCase();
+    const lang = String(v.iso_639_1 || '');
+    let s = 0;
+    if (t === 'trailer') s += 10;
+    if (t === 'teaser') s += 5;
+    if (lang === 'es') s += 4;
+    if (lang === 'en') s += 2;
+    if (v.official) s += 3;
+    return s;
+  };
+  list.sort((a, b) => rank(b) - rank(a));
+  return 'https://www.youtube.com/watch?v=' + list[0].key;
 }
 
 // ─── IntroDB solo en play ────────────────────────────────────────────────────
