@@ -13,7 +13,7 @@
 
 const ADDON_ID = 'magis-vod';
 const DEFAULTS = {
-  hosts: 'sqacjy.s5lm5aydc.xyz,osuhk.m3x8o50te.com',
+  hosts: 'osuhk.m3x8o50te.com,oogoy.f30c96w8.com',
   scheme: 'https',
   appId: 'com.android.msandroid',
   apkVersion: '49902',
